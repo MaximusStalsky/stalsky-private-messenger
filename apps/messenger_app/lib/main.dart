@@ -303,13 +303,14 @@ class ApiClient {
     return decode(await http.Response.fromStream(streamed));
   }
 
-  Future<void> delete(String path) async {
+  Future<Map<String, dynamic>> delete(String path) async {
     final response = await http.delete(uri(path), headers: headers());
     if (response.statusCode >= 400) {
       throw ApiException(
         response.body.isEmpty ? 'request_failed' : response.body,
       );
     }
+    return decode(response);
   }
 
   Future<void> deleteJson(String path, Map<String, dynamic> body) async {
@@ -362,10 +363,9 @@ class ApiClient {
         'messageId': messageId,
       });
     }
-    await delete(
+    return delete(
       '/api/chats/${Uri.encodeComponent(chatId)}/pins/${Uri.encodeComponent(messageId)}',
     );
-    return <String, dynamic>{};
   }
 
   Future<List<ChatMessage>> searchMessages(String chatId, String query) async {
@@ -766,6 +766,8 @@ class ChatMessage {
     this.reactions = const {},
     this.voiceUrl,
     this.voiceDurationSeconds,
+    this.localVoicePath,
+    this.uploading = false,
     this.replyToMessageId,
     this.replyToText,
     this.replyToSenderName,
@@ -783,6 +785,8 @@ class ChatMessage {
   final Map<String, int> reactions;
   final String? voiceUrl;
   final int? voiceDurationSeconds;
+  final String? localVoicePath;
+  final bool uploading;
   final String? replyToMessageId;
   final String? replyToText;
   final String? replyToSenderName;
@@ -830,6 +834,8 @@ class ChatMessage {
     Map<String, int>? reactions,
     String? voiceUrl,
     int? voiceDurationSeconds,
+    String? localVoicePath,
+    bool? uploading,
     String? replyToMessageId,
     String? replyToText,
     String? replyToSenderName,
@@ -847,6 +853,8 @@ class ChatMessage {
     reactions: reactions ?? this.reactions,
     voiceUrl: voiceUrl ?? this.voiceUrl,
     voiceDurationSeconds: voiceDurationSeconds ?? this.voiceDurationSeconds,
+    localVoicePath: localVoicePath ?? this.localVoicePath,
+    uploading: uploading ?? this.uploading,
     replyToMessageId: replyToMessageId ?? this.replyToMessageId,
     replyToText: replyToText ?? this.replyToText,
     replyToSenderName: replyToSenderName ?? this.replyToSenderName,
@@ -1682,6 +1690,20 @@ class _MessengerHomeState extends State<MessengerHome>
     final updated = data['message'];
     if (updated is Map<String, dynamic>) {
       replaceLocalMessage(ChatMessage.fromJson(updated));
+    } else if (data['pins'] is List) {
+      final pinIds = (data['pins'] as List)
+          .whereType<Map<String, dynamic>>()
+          .map((pin) => pin['messageId']?.toString())
+          .whereType<String>()
+          .toSet();
+      setState(() {
+        final list = messages[message.chatId];
+        if (list == null) return;
+        messages[message.chatId] = [
+          for (final item in list)
+            item.copyWith(pinned: pinIds.contains(item.id)),
+        ];
+      });
     } else {
       replaceLocalMessage(message.copyWith(pinned: pinned));
     }
@@ -1699,23 +1721,47 @@ class _MessengerHomeState extends State<MessengerHome>
     await api.setAutoDelete(chat.id, seconds);
   }
 
-  Future<void> sendVoiceMessage(Uint8List bytes, int durationSeconds) async {
+  Future<void> sendVoiceMessage(String path, int durationSeconds) async {
     final chat = selectedChat;
     if (chat == null) return;
-    final data = await api.sendVoiceMessage(
-      chat.id,
-      bytes,
-      durationSeconds: durationSeconds,
-    );
-    final message = ChatMessage.fromJson(
-      data['message'] as Map<String, dynamic>,
+    final localId = 'local_${DateTime.now().microsecondsSinceEpoch}';
+    final localMessage = ChatMessage(
+      id: localId,
+      chatId: chat.id,
+      senderId: currentUser!.id,
+      senderName: currentUser!.displayName,
+      text: '',
+      createdAt: DateTime.now().toIso8601String(),
+      voiceDurationSeconds: durationSeconds,
+      localVoicePath: path,
+      uploading: true,
     );
     messages.putIfAbsent(chat.id, () => []);
-    if (!messages[chat.id]!.any((item) => item.id == message.id)) {
-      messages[chat.id]!.add(message);
-    }
-    await loadChats();
+    messages[chat.id]!.add(localMessage);
     if (mounted) setState(() {});
+    try {
+      final bytes = await XFile(path).readAsBytes();
+      final data = await api.sendVoiceMessage(
+        chat.id,
+        bytes,
+        durationSeconds: durationSeconds,
+      );
+      final message = ChatMessage.fromJson(
+        data['message'] as Map<String, dynamic>,
+      ).copyWith(localVoicePath: path, uploading: false);
+      setState(() {
+        final list = messages[chat.id]!;
+        final index = list.indexWhere((item) => item.id == localId);
+        if (index == -1) {
+          list.add(message);
+        } else {
+          list[index] = message;
+        }
+      });
+      await loadChats();
+    } catch (_) {
+      replaceLocalMessage(localMessage.copyWith(uploading: false));
+    }
   }
 
   Future<void> demoLogin() async {
@@ -1995,7 +2041,7 @@ class AppShell extends StatefulWidget {
   onSetMessagePinned;
   final Future<List<ChatMessage>> Function(String query) onSearchMessages;
   final Future<void> Function(int seconds) onSetAutoDeleteSeconds;
-  final Future<void> Function(Uint8List bytes, int durationSeconds)
+  final Future<void> Function(String path, int durationSeconds)
   onSendVoiceMessage;
   final Future<void> Function(ChatSummary chat) onStartVoiceCall;
   final Future<void> Function() onAcceptVoiceCall;
@@ -2918,7 +2964,7 @@ class ChatPane extends StatefulWidget {
   onSetMessagePinned;
   final Future<List<ChatMessage>> Function(String query) onSearchMessages;
   final Future<void> Function(int seconds) onSetAutoDeleteSeconds;
-  final Future<void> Function(Uint8List bytes, int durationSeconds)
+  final Future<void> Function(String path, int durationSeconds)
   onSendVoiceMessage;
   final Future<void> Function(ChatSummary chat) onStartVoiceCall;
 
@@ -2938,10 +2984,13 @@ class _ChatPaneState extends State<ChatPane> {
   bool searchOpen = false;
   bool searching = false;
   bool recordingVoice = false;
+  bool backSwipeArmed = false;
   DateTime? recordStartedAt;
   String? playingVoiceId;
   StreamSubscription<void>? playerCompleteSub;
   ChatMessage? replyingTo;
+  String? swipingMessageId;
+  double swipeOffset = 0;
 
   @override
   void initState() {
@@ -3071,10 +3120,13 @@ class _ChatPaneState extends State<ChatPane> {
   }
 
   void startReply(ChatMessage message) {
+    HapticFeedback.selectionClick();
     setState(() {
       replyingTo = message;
       editingMessage = null;
       selectedIds.clear();
+      swipingMessageId = null;
+      swipeOffset = 0;
     });
   }
 
@@ -3283,8 +3335,7 @@ class _ChatPaneState extends State<ChatPane> {
           .difference(started)
           .inSeconds
           .clamp(1, 3600);
-      final bytes = await XFile(path).readAsBytes();
-      await widget.onSendVoiceMessage(bytes, duration);
+      await widget.onSendVoiceMessage(path, duration);
     }
   }
 
@@ -3294,9 +3345,15 @@ class _ChatPaneState extends State<ChatPane> {
       setState(() => playingVoiceId = null);
       return;
     }
+    await voicePlayer.stop();
+    final localPath = message.localVoicePath;
+    if (!kIsWeb && localPath != null && localPath.isNotEmpty) {
+      await voicePlayer.play(DeviceFileSource(localPath));
+      setState(() => playingVoiceId = message.id);
+      return;
+    }
     final url = mediaUrl(widget.apiBaseUrl, message.voiceUrl);
     if (url.isEmpty) return;
-    await voicePlayer.stop();
     final response = await http.get(Uri.parse(url));
     if (response.statusCode >= 400 || response.bodyBytes.isEmpty) return;
     if (kIsWeb) {
@@ -3363,6 +3420,15 @@ class _ChatPaneState extends State<ChatPane> {
                         : scheme.onSurfaceVariant,
                   ),
                 ),
+                if (message.uploading)
+                  Text(
+                    'sending...',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: mine
+                          ? Colors.white.withValues(alpha: 0.62)
+                          : scheme.onSurfaceVariant,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -3480,104 +3546,119 @@ class _ChatPaneState extends State<ChatPane> {
     final sendTextMode = hasText || editingMessage != null;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
+      onHorizontalDragUpdate: widget.onBack == null
+          ? null
+          : (details) {
+              if (!backSwipeArmed && details.delta.dx > 8) {
+                backSwipeArmed = true;
+                HapticFeedback.selectionClick();
+              }
+            },
       onHorizontalDragEnd: widget.onBack == null
           ? null
           : (details) {
               final velocity = details.primaryVelocity ?? 0;
-              if (velocity > 650) widget.onBack!();
+              if (velocity > 650) {
+                HapticFeedback.lightImpact();
+                widget.onBack!();
+              }
+              backSwipeArmed = false;
             },
+      onHorizontalDragCancel: () => backSwipeArmed = false,
       child: Column(
         children: [
-          Container(
-            color: scheme.surface,
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-            child: Row(
-              children: [
-                if (selectedIds.isNotEmpty)
-                  IconButton(
-                    onPressed: clearSelection,
-                    icon: const Icon(Icons.close),
-                    tooltip: 'Cancel',
-                  )
-                else if (widget.onBack != null)
-                  IconButton(
-                    onPressed: widget.onBack,
-                    icon: const Icon(Icons.arrow_back),
-                    tooltip: 'Back',
-                  ),
-                if (selectedIds.isNotEmpty) ...[
-                  Expanded(
-                    child: Text(
-                      '${selectedIds.length} selected',
-                      style: const TextStyle(fontWeight: FontWeight.w700),
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: copySelected,
-                    icon: const Icon(Icons.copy),
-                    tooltip: 'Copy',
-                  ),
-                  IconButton(
-                    onPressed: selectAll,
-                    icon: const Icon(Icons.select_all),
-                    tooltip: 'Select all',
-                  ),
-                  if (selectedMine)
+          ClipRect(
+            child: Container(
+              color: scheme.surface.withValues(alpha: 0.88),
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+              child: Row(
+                children: [
+                  if (selectedIds.isNotEmpty)
                     IconButton(
-                      onPressed: () => startEdit(selected.first),
-                      icon: const Icon(Icons.edit),
-                      tooltip: 'Edit',
+                      onPressed: clearSelection,
+                      icon: const Icon(Icons.close),
+                      tooltip: 'Cancel',
+                    )
+                  else if (widget.onBack != null)
+                    IconButton(
+                      onPressed: widget.onBack,
+                      icon: const Icon(Icons.arrow_back),
+                      tooltip: 'Back',
                     ),
-                  IconButton(
-                    onPressed: deleteSelected,
-                    icon: const Icon(Icons.delete_outline),
-                    tooltip: 'Delete',
-                  ),
-                ] else ...[
-                  PresenceAvatar(
-                    apiBaseUrl: widget.apiBaseUrl,
-                    name: chat.peerDisplayName,
-                    avatarUrl: chat.peerAvatarUrl,
-                    online: chat.peerOnline,
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          chat.peerDisplayName,
-                          style: const TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                        Text(
-                          peerStatus(chat),
-                          style: Theme.of(context).textTheme.bodySmall
-                              ?.copyWith(
-                                color: chat.peerOnline
-                                    ? const Color(0xFF229ED9)
-                                    : scheme.onSurfaceVariant,
-                              ),
-                        ),
-                      ],
+                  if (selectedIds.isNotEmpty) ...[
+                    Expanded(
+                      child: Text(
+                        '${selectedIds.length} selected',
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
                     ),
-                  ),
-                  IconButton(
-                    onPressed: () => setState(() => searchOpen = !searchOpen),
-                    icon: const Icon(Icons.search),
-                    tooltip: 'Search',
-                  ),
-                  IconButton(
-                    onPressed: showAutoDeleteSettings,
-                    icon: const Icon(Icons.timer_outlined),
-                    tooltip: 'Auto-delete',
-                  ),
-                  IconButton.filledTonal(
-                    onPressed: () => widget.onStartVoiceCall(chat),
-                    icon: const Icon(Icons.call),
-                    tooltip: s.call,
-                  ),
+                    IconButton(
+                      onPressed: copySelected,
+                      icon: const Icon(Icons.copy),
+                      tooltip: 'Copy',
+                    ),
+                    IconButton(
+                      onPressed: selectAll,
+                      icon: const Icon(Icons.select_all),
+                      tooltip: 'Select all',
+                    ),
+                    if (selectedMine)
+                      IconButton(
+                        onPressed: () => startEdit(selected.first),
+                        icon: const Icon(Icons.edit),
+                        tooltip: 'Edit',
+                      ),
+                    IconButton(
+                      onPressed: deleteSelected,
+                      icon: const Icon(Icons.delete_outline),
+                      tooltip: 'Delete',
+                    ),
+                  ] else ...[
+                    PresenceAvatar(
+                      apiBaseUrl: widget.apiBaseUrl,
+                      name: chat.peerDisplayName,
+                      avatarUrl: chat.peerAvatarUrl,
+                      online: chat.peerOnline,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            chat.peerDisplayName,
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          Text(
+                            peerStatus(chat),
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(
+                                  color: chat.peerOnline
+                                      ? const Color(0xFF229ED9)
+                                      : scheme.onSurfaceVariant,
+                                ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: () => setState(() => searchOpen = !searchOpen),
+                      icon: const Icon(Icons.search),
+                      tooltip: 'Search',
+                    ),
+                    IconButton(
+                      onPressed: showAutoDeleteSettings,
+                      icon: const Icon(Icons.timer_outlined),
+                      tooltip: 'Auto-delete',
+                    ),
+                    IconButton.filledTonal(
+                      onPressed: () => widget.onStartVoiceCall(chat),
+                      icon: const Icon(Icons.call),
+                      tooltip: s.call,
+                    ),
+                  ],
                 ],
-              ],
+              ),
             ),
           ),
           if (searchOpen)
@@ -3681,10 +3762,30 @@ class _ChatPaneState extends State<ChatPane> {
                         ? Alignment.centerRight
                         : Alignment.centerLeft,
                     child: GestureDetector(
+                      onHorizontalDragStart: (_) => setState(() {
+                        swipingMessageId = message.id;
+                        swipeOffset = 0;
+                      }),
+                      onHorizontalDragUpdate: (details) => setState(() {
+                        swipingMessageId = message.id;
+                        swipeOffset = (swipeOffset + details.delta.dx).clamp(
+                          0,
+                          56,
+                        );
+                      }),
                       onHorizontalDragEnd: (details) {
                         final velocity = details.primaryVelocity ?? 0;
-                        if (velocity > 450) startReply(message);
+                        final shouldReply = velocity > 450 || swipeOffset > 34;
+                        setState(() {
+                          swipingMessageId = null;
+                          swipeOffset = 0;
+                        });
+                        if (shouldReply) startReply(message);
                       },
+                      onHorizontalDragCancel: () => setState(() {
+                        swipingMessageId = null;
+                        swipeOffset = 0;
+                      }),
                       onLongPressStart: (details) =>
                           showMessageMenu(message, details.globalPosition),
                       onSecondaryTapDown: (details) =>
@@ -3692,69 +3793,84 @@ class _ChatPaneState extends State<ChatPane> {
                       onTap: selectedIds.isEmpty
                           ? null
                           : () => toggleSelection(message),
-                      child: Container(
-                        constraints: BoxConstraints(maxWidth: maxBubbleWidth),
-                        margin: const EdgeInsets.only(bottom: 6),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 8,
+                      child: AnimatedSlide(
+                        duration: const Duration(milliseconds: 120),
+                        curve: Curves.easeOutCubic,
+                        offset: Offset(
+                          swipingMessageId == message.id
+                              ? swipeOffset / maxBubbleWidth
+                              : 0,
+                          0,
                         ),
-                        decoration: BoxDecoration(
-                          color: isSelected
-                              ? scheme.secondaryContainer
-                              : isHighlighted
-                              ? scheme.tertiaryContainer.withValues(alpha: 0.7)
-                              : mine
-                              ? const Color(0xFF2D83BD)
-                              : scheme.surfaceContainerHighest,
-                          borderRadius: BorderRadius.only(
-                            topLeft: const Radius.circular(18),
-                            topRight: const Radius.circular(18),
-                            bottomLeft: Radius.circular(mine ? 18 : 5),
-                            bottomRight: Radius.circular(mine ? 5 : 18),
+                        child: Container(
+                          constraints: BoxConstraints(maxWidth: maxBubbleWidth),
+                          margin: const EdgeInsets.only(bottom: 6),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 8,
                           ),
-                          border: Border.all(
+                          decoration: BoxDecoration(
                             color: isSelected
-                                ? scheme.primary
-                                : Colors.transparent,
-                          ),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            buildReplyPreview(context, message, mine),
-                            if (message.voiceUrl != null)
-                              buildVoiceMessage(context, message, mine)
-                            else
-                              Text(
-                                message.text,
-                                style: TextStyle(
-                                  color: mine ? Colors.white : scheme.onSurface,
-                                ),
-                              ),
-                            if (message.reactions.isNotEmpty)
-                              Padding(
-                                padding: const EdgeInsets.only(top: 6),
-                                child: Wrap(
-                                  spacing: 4,
-                                  children: message.reactions.entries
-                                      .map(
-                                        (entry) => Chip(
-                                          label: Text(
-                                            '${entry.key} ${entry.value}',
-                                          ),
-                                          visualDensity: VisualDensity.compact,
-                                        ),
-                                      )
-                                      .toList(),
-                                ),
-                              ),
-                            Align(
-                              alignment: Alignment.centerRight,
-                              child: messageMeta(context, message, mine),
+                                ? scheme.secondaryContainer
+                                : isHighlighted
+                                ? scheme.tertiaryContainer.withValues(
+                                    alpha: 0.7,
+                                  )
+                                : mine
+                                ? const Color(0xFF2D83BD)
+                                : scheme.surfaceContainerHighest,
+                            borderRadius: BorderRadius.only(
+                              topLeft: const Radius.circular(18),
+                              topRight: const Radius.circular(18),
+                              bottomLeft: Radius.circular(mine ? 18 : 5),
+                              bottomRight: Radius.circular(mine ? 5 : 18),
                             ),
-                          ],
+                            border: Border.all(
+                              color: isSelected
+                                  ? scheme.primary
+                                  : Colors.transparent,
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              buildReplyPreview(context, message, mine),
+                              if (message.voiceUrl != null)
+                                buildVoiceMessage(context, message, mine)
+                              else
+                                Text(
+                                  message.text,
+                                  style: TextStyle(
+                                    color: mine
+                                        ? Colors.white
+                                        : scheme.onSurface,
+                                  ),
+                                ),
+                              if (message.reactions.isNotEmpty)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 6),
+                                  child: Wrap(
+                                    spacing: 4,
+                                    children: message.reactions.entries
+                                        .map(
+                                          (entry) => Chip(
+                                            label: Text(
+                                              '${entry.key} ${entry.value}',
+                                            ),
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                          ),
+                                        )
+                                        .toList(),
+                                  ),
+                                ),
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: messageMeta(context, message, mine),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -3824,8 +3940,8 @@ class _ChatPaneState extends State<ChatPane> {
               ),
             ),
           Container(
-            color: scheme.surface,
-            padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+            color: Colors.transparent,
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
             child: Row(
               children: [
                 if (recordingVoice) ...[
@@ -3837,23 +3953,36 @@ class _ChatPaneState extends State<ChatPane> {
                   const SizedBox(width: 8),
                 ],
                 Expanded(
-                  child: recordingVoice
-                      ? Text(
-                          'Recording voice message...',
-                          style: Theme.of(context).textTheme.bodyLarge,
-                        )
-                      : TextField(
-                          controller: text,
-                          minLines: 1,
-                          maxLines: 4,
-                          onSubmitted: (_) => submit(),
-                          decoration: InputDecoration(
-                            hintText: editingMessage == null
-                                ? s.message
-                                : 'Edit message',
-                            border: const OutlineInputBorder(),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: scheme.surface.withValues(alpha: 0.9),
+                      borderRadius: BorderRadius.circular(28),
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                    child: recordingVoice
+                        ? Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            child: Text(
+                              'Recording voice message...',
+                              style: Theme.of(context).textTheme.bodyLarge,
+                            ),
+                          )
+                        : TextField(
+                            controller: text,
+                            minLines: 1,
+                            maxLines: 4,
+                            onSubmitted: (_) => submit(),
+                            decoration: InputDecoration(
+                              hintText: editingMessage == null
+                                  ? s.message
+                                  : 'Edit message',
+                              border: InputBorder.none,
+                              prefixIcon: const Icon(
+                                Icons.emoji_emotions_outlined,
+                              ),
+                            ),
                           ),
-                        ),
+                  ),
                 ),
                 const SizedBox(width: 10),
                 IconButton.filled(

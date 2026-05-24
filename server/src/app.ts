@@ -764,7 +764,7 @@ export function buildApp(options: { db?: Db } = {}) {
     db.prepare('DELETE FROM pinned_messages WHERE chat_id = ? AND message_id = ?').run(chatId, messageId);
     const pins = db.prepare('SELECT message_id AS messageId, pinned_by AS pinnedBy, pinned_at AS pinnedAt FROM pinned_messages WHERE chat_id = ? ORDER BY pinned_at DESC').all(chatId);
     broadcastToUsers(chatMembers(db, chatId), { type: 'message.pinned', chatId, pins });
-    return reply.code(204).send();
+    return { pins };
   });
 
   app.get('/api/chats/:chatId/settings', async (request, reply) => {
