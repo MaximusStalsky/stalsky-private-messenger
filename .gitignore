@@ -1,0 +1,16 @@
+node_modules/
+.dart_tool/
+build/
+.deploy/
+server/data/
+server/*.log
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+secret.env
+*HANDOFF*.md
+apps/messenger_app/android/local.properties
+!.env.example

@@ -1,0 +1,9 @@
+**/node_modules
+**/.dart_tool
+apps/messenger_app/build/**
+!apps/messenger_app/build/web/
+!apps/messenger_app/build/web/**
+server/data
+secret.env
+.deploy
+*.log

@@ -1,0 +1,16 @@
+services:
+  my-messenger:
+    build: .
+    container_name: my-messenger
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATABASE_URL: /data/messenger.sqlite
+      NODE_ENV: production
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
