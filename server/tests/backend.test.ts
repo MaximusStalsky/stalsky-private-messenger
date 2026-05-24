@@ -227,9 +227,15 @@ describe('contacts, chats, and messages', () => {
     expect(sent.statusCode).toBe(201);
     expect(sent.json().message.text).toBe('Hello Anna');
 
+    const replied = await authPost(anna.token, `/api/chats/${encodeURIComponent(chatId)}/messages`, { text: 'Reply text', replyToMessageId: sent.json().message.id });
+    expect(replied.statusCode).toBe(201);
+    expect(replied.json().message.replyToText).toBe('Hello Anna');
+    expect(replied.json().message.replyToSenderName).toBe('Max');
+
     const messages = await authGet(anna.token, `/api/chats/${encodeURIComponent(chatId)}/messages`);
     expect(messages.statusCode).toBe(200);
     expect(messages.json().messages[0].text).toBe('Hello Anna');
+    expect(messages.json().messages[1].replyToMessageId).toBe(sent.json().message.id);
   });
 
   it('edits own messages, searches chat text, reacts, and deletes selected direct messages for everyone', async () => {

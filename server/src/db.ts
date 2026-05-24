@@ -143,4 +143,5 @@ export function migrate(db: Db) {
   if (!hasMessageColumn('deleted_at')) db.exec('ALTER TABLE messages ADD COLUMN deleted_at TEXT');
   if (!hasMessageColumn('edited_at')) db.exec('ALTER TABLE messages ADD COLUMN edited_at TEXT');
   if (!hasMessageColumn('auto_delete_at')) db.exec('ALTER TABLE messages ADD COLUMN auto_delete_at TEXT');
+  if (!hasMessageColumn('reply_to_message_id')) db.exec('ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT');
 }

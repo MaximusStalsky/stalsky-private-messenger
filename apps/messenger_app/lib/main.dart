@@ -766,6 +766,10 @@ class ChatMessage {
     this.reactions = const {},
     this.voiceUrl,
     this.voiceDurationSeconds,
+    this.replyToMessageId,
+    this.replyToText,
+    this.replyToSenderName,
+    this.replyToType,
   });
   final String id;
   final String chatId;
@@ -779,6 +783,10 @@ class ChatMessage {
   final Map<String, int> reactions;
   final String? voiceUrl;
   final int? voiceDurationSeconds;
+  final String? replyToMessageId;
+  final String? replyToText;
+  final String? replyToSenderName;
+  final String? replyToType;
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
     id: json['id'] as String,
@@ -808,6 +816,10 @@ class ChatMessage {
                     ? null
                     : ((json['durationMs'] as num) / 1000).ceil()))
             ?.toInt(),
+    replyToMessageId: json['replyToMessageId'] as String?,
+    replyToText: json['replyToText'] as String?,
+    replyToSenderName: json['replyToSenderName'] as String?,
+    replyToType: json['replyToType'] as String?,
   );
 
   ChatMessage copyWith({
@@ -818,6 +830,10 @@ class ChatMessage {
     Map<String, int>? reactions,
     String? voiceUrl,
     int? voiceDurationSeconds,
+    String? replyToMessageId,
+    String? replyToText,
+    String? replyToSenderName,
+    String? replyToType,
   }) => ChatMessage(
     id: id,
     chatId: chatId,
@@ -831,6 +847,10 @@ class ChatMessage {
     reactions: reactions ?? this.reactions,
     voiceUrl: voiceUrl ?? this.voiceUrl,
     voiceDurationSeconds: voiceDurationSeconds ?? this.voiceDurationSeconds,
+    replyToMessageId: replyToMessageId ?? this.replyToMessageId,
+    replyToText: replyToText ?? this.replyToText,
+    replyToSenderName: replyToSenderName ?? this.replyToSenderName,
+    replyToType: replyToType ?? this.replyToType,
   );
 }
 
@@ -1603,12 +1623,15 @@ class _MessengerHomeState extends State<MessengerHome>
     await openChatById(chatId);
   }
 
-  Future<void> sendMessage(String text) async {
+  Future<void> sendMessage(String text, {ChatMessage? replyTo}) async {
     final chat = selectedChat;
     if (chat == null || text.trim().isEmpty) return;
     final data = await api.postJson(
       '/api/chats/${Uri.encodeComponent(chat.id)}/messages',
-      {'text': text.trim()},
+      {
+        'text': text.trim(),
+        if (replyTo != null) 'replyToMessageId': replyTo.id,
+      },
     );
     final message = ChatMessage.fromJson(
       data['message'] as Map<String, dynamic>,
@@ -1962,7 +1985,8 @@ class AppShell extends StatefulWidget {
   final Future<List<UserProfile>> Function(String username) onSearch;
   final Future<void> Function(String username) onAddContact;
   final Future<void> Function(ChatSummary chat) onOpenChat;
-  final Future<void> Function(String text) onSendMessage;
+  final Future<void> Function(String text, {ChatMessage? replyTo})
+  onSendMessage;
   final Future<void> Function(ChatMessage message, String text) onEditMessage;
   final Future<void> Function(List<ChatMessage> messages) onDeleteMessages;
   final Future<void> Function(ChatMessage message, String reaction)
@@ -2120,32 +2144,22 @@ class PresenceAvatar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Stack(
-      clipBehavior: Clip.none,
-      children: [
-        UserAvatar(
-          apiBaseUrl: apiBaseUrl,
-          name: name,
-          avatarUrl: avatarUrl,
-          radius: radius,
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
+      padding: EdgeInsets.all(online ? 2.5 : 0),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: online ? const Color(0xFF229ED9) : Colors.transparent,
+          width: online ? 2 : 0,
         ),
-        Positioned(
-          right: -1,
-          bottom: -1,
-          child: Container(
-            width: 12,
-            height: 12,
-            decoration: BoxDecoration(
-              color: online ? const Color(0xFF37C978) : Colors.transparent,
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: Theme.of(context).colorScheme.surface,
-                width: 2,
-              ),
-            ),
-          ),
-        ),
-      ],
+      ),
+      child: UserAvatar(
+        apiBaseUrl: apiBaseUrl,
+        name: name,
+        avatarUrl: avatarUrl,
+        radius: radius,
+      ),
     );
   }
 }
@@ -2895,7 +2909,7 @@ class ChatPane extends StatefulWidget {
   final String apiBaseUrl;
   final List<ChatMessage> messages;
   final VoidCallback? onBack;
-  final Future<void> Function(String text) onSend;
+  final Future<void> Function(String text, {ChatMessage? replyTo}) onSend;
   final Future<void> Function(ChatMessage message, String text) onEditMessage;
   final Future<void> Function(List<ChatMessage> messages) onDeleteMessages;
   final Future<void> Function(ChatMessage message, String reaction)
@@ -2927,6 +2941,7 @@ class _ChatPaneState extends State<ChatPane> {
   DateTime? recordStartedAt;
   String? playingVoiceId;
   StreamSubscription<void>? playerCompleteSub;
+  ChatMessage? replyingTo;
 
   @override
   void initState() {
@@ -2937,6 +2952,9 @@ class _ChatPaneState extends State<ChatPane> {
     playerCompleteSub = voicePlayer.onPlayerComplete.listen((_) {
       if (mounted) setState(() => playingVoiceId = null);
     });
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => scrollToBottom(jump: true),
+    );
   }
 
   @override
@@ -2953,11 +2971,28 @@ class _ChatPaneState extends State<ChatPane> {
   @override
   void didUpdateWidget(covariant ChatPane oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.messages.length != oldWidget.messages.length) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (scroll.hasClients) scroll.jumpTo(scroll.position.maxScrollExtent);
-      });
+    if (widget.chat?.id != oldWidget.chat?.id ||
+        widget.messages.length != oldWidget.messages.length) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => scrollToBottom(jump: true),
+      );
     }
+  }
+
+  void scrollToBottom({bool jump = false}) {
+    if (!scroll.hasClients) return;
+    final target = scroll.position.maxScrollExtent;
+    if (jump) {
+      scroll.jumpTo(target);
+      return;
+    }
+    unawaited(
+      scroll.animateTo(
+        target,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
+      ),
+    );
   }
 
   Future<void> submit() async {
@@ -2965,7 +3000,9 @@ class _ChatPaneState extends State<ChatPane> {
     text.clear();
     final editing = editingMessage;
     if (editing == null) {
-      await widget.onSend(value);
+      final reply = replyingTo;
+      setState(() => replyingTo = null);
+      await widget.onSend(value, replyTo: reply);
     } else {
       await widget.onEditMessage(editing, value);
       setState(() => editingMessage = null);
@@ -3027,7 +3064,16 @@ class _ChatPaneState extends State<ChatPane> {
     if (message.senderId != widget.user.id || message.voiceUrl != null) return;
     setState(() {
       editingMessage = message;
+      replyingTo = null;
       text.text = message.text;
+      selectedIds.clear();
+    });
+  }
+
+  void startReply(ChatMessage message) {
+    setState(() {
+      replyingTo = message;
+      editingMessage = null;
       selectedIds.clear();
     });
   }
@@ -3077,6 +3123,14 @@ class _ChatPaneState extends State<ChatPane> {
             ),
           ),
         const PopupMenuItem(
+          value: 'reply',
+          child: ListTile(
+            leading: Icon(Icons.reply),
+            title: Text('Reply'),
+            dense: true,
+          ),
+        ),
+        const PopupMenuItem(
           value: 'react',
           child: ListTile(
             leading: Icon(Icons.add_reaction_outlined),
@@ -3125,6 +3179,8 @@ class _ChatPaneState extends State<ChatPane> {
     switch (action) {
       case 'copy':
         await copyMessage(message);
+      case 'reply':
+        startReply(message);
       case 'react':
         await pickReaction(message);
       case 'pin':
@@ -3243,7 +3299,16 @@ class _ChatPaneState extends State<ChatPane> {
     await voicePlayer.stop();
     final response = await http.get(Uri.parse(url));
     if (response.statusCode >= 400 || response.bodyBytes.isEmpty) return;
-    await voicePlayer.play(BytesSource(response.bodyBytes));
+    if (kIsWeb) {
+      await voicePlayer.play(BytesSource(response.bodyBytes));
+    } else {
+      final directory = await getTemporaryDirectory();
+      final segments = Uri.parse(url).pathSegments;
+      final safeName = segments.isEmpty ? '${message.id}.m4a' : segments.last;
+      final path = '${directory.path}/play_$safeName';
+      await XFile.fromData(response.bodyBytes).saveTo(path);
+      await voicePlayer.play(DeviceFileSource(path));
+    }
     setState(() => playingVoiceId = message.id);
   }
 
@@ -3312,6 +3377,59 @@ class _ChatPaneState extends State<ChatPane> {
     );
   }
 
+  Widget buildReplyPreview(
+    BuildContext context,
+    ChatMessage message,
+    bool mine,
+  ) {
+    final scheme = Theme.of(context).colorScheme;
+    final title = message.replyToSenderName ?? 'Reply';
+    final text = message.replyToType == 'voice'
+        ? 'Voice message'
+        : (message.replyToText ?? '');
+    if (message.replyToMessageId == null || text.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
+      decoration: BoxDecoration(
+        color: mine
+            ? Colors.white.withValues(alpha: 0.14)
+            : scheme.surface.withValues(alpha: 0.58),
+        borderRadius: BorderRadius.circular(8),
+        border: const Border(
+          left: BorderSide(color: Color(0xFF54B7F3), width: 3),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              color: mine ? Colors.white : const Color(0xFF229ED9),
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: mine
+                  ? Colors.white.withValues(alpha: 0.86)
+                  : scheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget messageMeta(BuildContext context, ChatMessage message, bool mine) {
     final scheme = Theme.of(context).colorScheme;
     final color = mine
@@ -3360,346 +3478,408 @@ class _ChatPaneState extends State<ChatPane> {
         selected.length == 1 && selected.first.senderId == widget.user.id;
     final hasText = text.text.trim().isNotEmpty;
     final sendTextMode = hasText || editingMessage != null;
-    return Column(
-      children: [
-        Container(
-          color: scheme.surface,
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-          child: Row(
-            children: [
-              if (selectedIds.isNotEmpty)
-                IconButton(
-                  onPressed: clearSelection,
-                  icon: const Icon(Icons.close),
-                  tooltip: 'Cancel',
-                )
-              else if (widget.onBack != null)
-                IconButton(
-                  onPressed: widget.onBack,
-                  icon: const Icon(Icons.arrow_back),
-                  tooltip: 'Back',
-                ),
-              if (selectedIds.isNotEmpty) ...[
-                Expanded(
-                  child: Text(
-                    '${selectedIds.length} selected',
-                    style: const TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                ),
-                IconButton(
-                  onPressed: copySelected,
-                  icon: const Icon(Icons.copy),
-                  tooltip: 'Copy',
-                ),
-                IconButton(
-                  onPressed: selectAll,
-                  icon: const Icon(Icons.select_all),
-                  tooltip: 'Select all',
-                ),
-                if (selectedMine)
-                  IconButton(
-                    onPressed: () => startEdit(selected.first),
-                    icon: const Icon(Icons.edit),
-                    tooltip: 'Edit',
-                  ),
-                IconButton(
-                  onPressed: deleteSelected,
-                  icon: const Icon(Icons.delete_outline),
-                  tooltip: 'Delete',
-                ),
-              ] else ...[
-                PresenceAvatar(
-                  apiBaseUrl: widget.apiBaseUrl,
-                  name: chat.peerDisplayName,
-                  avatarUrl: chat.peerAvatarUrl,
-                  online: chat.peerOnline,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        chat.peerDisplayName,
-                        style: const TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      Text(
-                        peerStatus(chat),
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: chat.peerOnline
-                              ? const Color(0xFF229ED9)
-                              : scheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                IconButton(
-                  onPressed: () => setState(() => searchOpen = !searchOpen),
-                  icon: const Icon(Icons.search),
-                  tooltip: 'Search',
-                ),
-                IconButton(
-                  onPressed: showAutoDeleteSettings,
-                  icon: const Icon(Icons.timer_outlined),
-                  tooltip: 'Auto-delete',
-                ),
-                IconButton.filledTonal(
-                  onPressed: () => widget.onStartVoiceCall(chat),
-                  icon: const Icon(Icons.call),
-                  tooltip: s.call,
-                ),
-              ],
-            ],
-          ),
-        ),
-        if (searchOpen)
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onHorizontalDragEnd: widget.onBack == null
+          ? null
+          : (details) {
+              final velocity = details.primaryVelocity ?? 0;
+              if (velocity > 650) widget.onBack!();
+            },
+      child: Column(
+        children: [
           Container(
             color: scheme.surface,
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
             child: Row(
               children: [
-                Expanded(
-                  child: TextField(
-                    controller: search,
-                    onSubmitted: (_) => runMessageSearch(),
-                    decoration: const InputDecoration(
-                      prefixIcon: Icon(Icons.search),
-                      hintText: 'Search in chat',
-                      border: OutlineInputBorder(),
+                if (selectedIds.isNotEmpty)
+                  IconButton(
+                    onPressed: clearSelection,
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Cancel',
+                  )
+                else if (widget.onBack != null)
+                  IconButton(
+                    onPressed: widget.onBack,
+                    icon: const Icon(Icons.arrow_back),
+                    tooltip: 'Back',
+                  ),
+                if (selectedIds.isNotEmpty) ...[
+                  Expanded(
+                    child: Text(
+                      '${selectedIds.length} selected',
+                      style: const TextStyle(fontWeight: FontWeight.w700),
                     ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                IconButton.filled(
-                  onPressed: searching ? null : runMessageSearch,
-                  icon: const Icon(Icons.arrow_forward),
-                  tooltip: 'Search',
-                ),
-              ],
-            ),
-          ),
-        if (pinned.isNotEmpty)
-          Container(
-            width: double.infinity,
-            color: scheme.surfaceContainerHighest.withValues(alpha: 0.65),
-            padding: const EdgeInsets.fromLTRB(14, 8, 10, 8),
-            child: Row(
-              children: [
-                Container(
-                  width: 3,
-                  height: 42,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF229ED9),
-                    borderRadius: BorderRadius.circular(6),
+                  IconButton(
+                    onPressed: copySelected,
+                    icon: const Icon(Icons.copy),
+                    tooltip: 'Copy',
                   ),
-                ),
-                const SizedBox(width: 10),
-                const Icon(Icons.push_pin, size: 18),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: InkWell(
-                    onTap: () =>
-                        setState(() => highlightedIds.add(pinned.first.id)),
+                  IconButton(
+                    onPressed: selectAll,
+                    icon: const Icon(Icons.select_all),
+                    tooltip: 'Select all',
+                  ),
+                  if (selectedMine)
+                    IconButton(
+                      onPressed: () => startEdit(selected.first),
+                      icon: const Icon(Icons.edit),
+                      tooltip: 'Edit',
+                    ),
+                  IconButton(
+                    onPressed: deleteSelected,
+                    icon: const Icon(Icons.delete_outline),
+                    tooltip: 'Delete',
+                  ),
+                ] else ...[
+                  PresenceAvatar(
+                    apiBaseUrl: widget.apiBaseUrl,
+                    name: chat.peerDisplayName,
+                    avatarUrl: chat.peerAvatarUrl,
+                    online: chat.peerOnline,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          pinned.length == 1
-                              ? 'Pinned message'
-                              : '${pinned.length} pinned messages',
-                          style: Theme.of(context).textTheme.labelMedium
-                              ?.copyWith(
-                                color: const Color(0xFF229ED9),
-                                fontWeight: FontWeight.w700,
-                              ),
+                          chat.peerDisplayName,
+                          style: const TextStyle(fontWeight: FontWeight.w700),
                         ),
                         Text(
-                          pinned.first.voiceUrl != null
+                          peerStatus(chat),
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(
+                                color: chat.peerOnline
+                                    ? const Color(0xFF229ED9)
+                                    : scheme.onSurfaceVariant,
+                              ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => setState(() => searchOpen = !searchOpen),
+                    icon: const Icon(Icons.search),
+                    tooltip: 'Search',
+                  ),
+                  IconButton(
+                    onPressed: showAutoDeleteSettings,
+                    icon: const Icon(Icons.timer_outlined),
+                    tooltip: 'Auto-delete',
+                  ),
+                  IconButton.filledTonal(
+                    onPressed: () => widget.onStartVoiceCall(chat),
+                    icon: const Icon(Icons.call),
+                    tooltip: s.call,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          if (searchOpen)
+            Container(
+              color: scheme.surface,
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: search,
+                      onSubmitted: (_) => runMessageSearch(),
+                      decoration: const InputDecoration(
+                        prefixIcon: Icon(Icons.search),
+                        hintText: 'Search in chat',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton.filled(
+                    onPressed: searching ? null : runMessageSearch,
+                    icon: const Icon(Icons.arrow_forward),
+                    tooltip: 'Search',
+                  ),
+                ],
+              ),
+            ),
+          if (pinned.isNotEmpty)
+            Container(
+              width: double.infinity,
+              color: scheme.surfaceContainerHighest.withValues(alpha: 0.65),
+              padding: const EdgeInsets.fromLTRB(14, 8, 10, 8),
+              child: Row(
+                children: [
+                  Container(
+                    width: 3,
+                    height: 42,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF229ED9),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  const Icon(Icons.push_pin, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: InkWell(
+                      onTap: () =>
+                          setState(() => highlightedIds.add(pinned.first.id)),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            pinned.length == 1
+                                ? 'Pinned message'
+                                : '${pinned.length} pinned messages',
+                            style: Theme.of(context).textTheme.labelMedium
+                                ?.copyWith(
+                                  color: const Color(0xFF229ED9),
+                                  fontWeight: FontWeight.w700,
+                                ),
+                          ),
+                          Text(
+                            pinned.first.voiceUrl != null
+                                ? 'Voice message'
+                                : pinned.first.text,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () async =>
+                        widget.onSetMessagePinned(pinned.first, false),
+                    icon: const Icon(Icons.close, size: 18),
+                    tooltip: 'Unpin',
+                  ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) => ListView.builder(
+                controller: scroll,
+                padding: const EdgeInsets.all(18),
+                itemCount: widget.messages.length,
+                itemBuilder: (context, index) {
+                  final message = widget.messages[index];
+                  final mine = message.senderId == widget.user.id;
+                  final isSelected = selectedIds.contains(message.id);
+                  final isHighlighted = highlightedIds.contains(message.id);
+                  final maxBubbleWidth = math.min(
+                    520.0,
+                    constraints.maxWidth * 0.78,
+                  );
+                  return Align(
+                    alignment: mine
+                        ? Alignment.centerRight
+                        : Alignment.centerLeft,
+                    child: GestureDetector(
+                      onHorizontalDragEnd: (details) {
+                        final velocity = details.primaryVelocity ?? 0;
+                        if (velocity > 450) startReply(message);
+                      },
+                      onLongPressStart: (details) =>
+                          showMessageMenu(message, details.globalPosition),
+                      onSecondaryTapDown: (details) =>
+                          showMessageMenu(message, details.globalPosition),
+                      onTap: selectedIds.isEmpty
+                          ? null
+                          : () => toggleSelection(message),
+                      child: Container(
+                        constraints: BoxConstraints(maxWidth: maxBubbleWidth),
+                        margin: const EdgeInsets.only(bottom: 6),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: isSelected
+                              ? scheme.secondaryContainer
+                              : isHighlighted
+                              ? scheme.tertiaryContainer.withValues(alpha: 0.7)
+                              : mine
+                              ? const Color(0xFF2D83BD)
+                              : scheme.surfaceContainerHighest,
+                          borderRadius: BorderRadius.only(
+                            topLeft: const Radius.circular(18),
+                            topRight: const Radius.circular(18),
+                            bottomLeft: Radius.circular(mine ? 18 : 5),
+                            bottomRight: Radius.circular(mine ? 5 : 18),
+                          ),
+                          border: Border.all(
+                            color: isSelected
+                                ? scheme.primary
+                                : Colors.transparent,
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            buildReplyPreview(context, message, mine),
+                            if (message.voiceUrl != null)
+                              buildVoiceMessage(context, message, mine)
+                            else
+                              Text(
+                                message.text,
+                                style: TextStyle(
+                                  color: mine ? Colors.white : scheme.onSurface,
+                                ),
+                              ),
+                            if (message.reactions.isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 6),
+                                child: Wrap(
+                                  spacing: 4,
+                                  children: message.reactions.entries
+                                      .map(
+                                        (entry) => Chip(
+                                          label: Text(
+                                            '${entry.key} ${entry.value}',
+                                          ),
+                                          visualDensity: VisualDensity.compact,
+                                        ),
+                                      )
+                                      .toList(),
+                                ),
+                              ),
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: messageMeta(context, message, mine),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+          if (editingMessage != null)
+            Container(
+              color: scheme.primaryContainer.withValues(alpha: 0.35),
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+              child: Row(
+                children: [
+                  const Icon(Icons.edit_outlined),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      editingMessage!.text,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => setState(() => editingMessage = null),
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Cancel edit',
+                  ),
+                ],
+              ),
+            ),
+          if (replyingTo != null)
+            Container(
+              color: scheme.primaryContainer.withValues(alpha: 0.22),
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+              child: Row(
+                children: [
+                  const Icon(Icons.reply),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          replyingTo!.senderName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        Text(
+                          replyingTo!.voiceUrl != null
                               ? 'Voice message'
-                              : pinned.first.text,
+                              : replyingTo!.text,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
                       ],
                     ),
                   ),
-                ),
-                IconButton(
-                  onPressed: () =>
-                      widget.onSetMessagePinned(pinned.first, false),
-                  icon: const Icon(Icons.close, size: 18),
-                  tooltip: 'Unpin',
-                ),
-              ],
-            ),
-          ),
-        Expanded(
-          child: ListView.builder(
-            controller: scroll,
-            padding: const EdgeInsets.all(18),
-            itemCount: widget.messages.length,
-            itemBuilder: (context, index) {
-              final message = widget.messages[index];
-              final mine = message.senderId == widget.user.id;
-              final isSelected = selectedIds.contains(message.id);
-              final isHighlighted = highlightedIds.contains(message.id);
-              return Align(
-                alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-                child: GestureDetector(
-                  onLongPressStart: (details) =>
-                      showMessageMenu(message, details.globalPosition),
-                  onSecondaryTapDown: (details) =>
-                      showMessageMenu(message, details.globalPosition),
-                  onTap: selectedIds.isEmpty
-                      ? null
-                      : () => toggleSelection(message),
-                  child: Container(
-                    constraints: const BoxConstraints(maxWidth: 520),
-                    margin: const EdgeInsets.only(bottom: 6),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      color: isSelected
-                          ? scheme.secondaryContainer
-                          : isHighlighted
-                          ? scheme.tertiaryContainer.withValues(alpha: 0.7)
-                          : mine
-                          ? const Color(0xFF2D83BD)
-                          : scheme.surfaceContainerHighest,
-                      borderRadius: BorderRadius.only(
-                        topLeft: const Radius.circular(18),
-                        topRight: const Radius.circular(18),
-                        bottomLeft: Radius.circular(mine ? 18 : 5),
-                        bottomRight: Radius.circular(mine ? 5 : 18),
-                      ),
-                      border: Border.all(
-                        color: isSelected ? scheme.primary : Colors.transparent,
-                      ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (message.voiceUrl != null)
-                          buildVoiceMessage(context, message, mine)
-                        else
-                          Text(
-                            message.text,
-                            style: TextStyle(
-                              color: mine ? Colors.white : scheme.onSurface,
-                            ),
-                          ),
-                        if (message.reactions.isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(top: 6),
-                            child: Wrap(
-                              spacing: 4,
-                              children: message.reactions.entries
-                                  .map(
-                                    (entry) => Chip(
-                                      label: Text(
-                                        '${entry.key} ${entry.value}',
-                                      ),
-                                      visualDensity: VisualDensity.compact,
-                                    ),
-                                  )
-                                  .toList(),
-                            ),
-                          ),
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: messageMeta(context, message, mine),
-                        ),
-                      ],
-                    ),
+                  IconButton(
+                    onPressed: () => setState(() => replyingTo = null),
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Cancel reply',
                   ),
-                ),
-              );
-            },
-          ),
-        ),
-        if (editingMessage != null)
+                ],
+              ),
+            ),
           Container(
-            color: scheme.primaryContainer.withValues(alpha: 0.35),
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+            color: scheme.surface,
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
             child: Row(
               children: [
-                const Icon(Icons.edit_outlined),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    editingMessage!.text,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                if (recordingVoice) ...[
+                  IconButton.filledTonal(
+                    onPressed: () => stopVoiceRecord(send: false),
+                    icon: const Icon(Icons.close),
+                    tooltip: 'Cancel voice message',
                   ),
+                  const SizedBox(width: 8),
+                ],
+                Expanded(
+                  child: recordingVoice
+                      ? Text(
+                          'Recording voice message...',
+                          style: Theme.of(context).textTheme.bodyLarge,
+                        )
+                      : TextField(
+                          controller: text,
+                          minLines: 1,
+                          maxLines: 4,
+                          onSubmitted: (_) => submit(),
+                          decoration: InputDecoration(
+                            hintText: editingMessage == null
+                                ? s.message
+                                : 'Edit message',
+                            border: const OutlineInputBorder(),
+                          ),
+                        ),
                 ),
-                IconButton(
-                  onPressed: () => setState(() => editingMessage = null),
-                  icon: const Icon(Icons.close),
-                  tooltip: 'Cancel edit',
+                const SizedBox(width: 10),
+                IconButton.filled(
+                  onPressed: recordingVoice
+                      ? () => stopVoiceRecord(send: true)
+                      : sendTextMode
+                      ? submit
+                      : startVoiceRecord,
+                  icon: Icon(
+                    recordingVoice
+                        ? Icons.check
+                        : sendTextMode
+                        ? Icons.send
+                        : Icons.mic,
+                  ),
+                  tooltip: recordingVoice
+                      ? 'Send voice message'
+                      : sendTextMode
+                      ? s.send
+                      : 'Record voice message',
                 ),
               ],
             ),
           ),
-        Container(
-          color: scheme.surface,
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
-          child: Row(
-            children: [
-              if (recordingVoice) ...[
-                IconButton.filledTonal(
-                  onPressed: () => stopVoiceRecord(send: false),
-                  icon: const Icon(Icons.close),
-                  tooltip: 'Cancel voice message',
-                ),
-                const SizedBox(width: 8),
-              ],
-              Expanded(
-                child: recordingVoice
-                    ? Text(
-                        'Recording voice message...',
-                        style: Theme.of(context).textTheme.bodyLarge,
-                      )
-                    : TextField(
-                        controller: text,
-                        minLines: 1,
-                        maxLines: 4,
-                        onSubmitted: (_) => submit(),
-                        decoration: InputDecoration(
-                          hintText: editingMessage == null
-                              ? s.message
-                              : 'Edit message',
-                          border: const OutlineInputBorder(),
-                        ),
-                      ),
-              ),
-              const SizedBox(width: 10),
-              IconButton.filled(
-                onPressed: recordingVoice
-                    ? () => stopVoiceRecord(send: true)
-                    : sendTextMode
-                    ? submit
-                    : startVoiceRecord,
-                icon: Icon(
-                  recordingVoice
-                      ? Icons.check
-                      : sendTextMode
-                      ? Icons.send
-                      : Icons.mic,
-                ),
-                tooltip: recordingVoice
-                    ? 'Send voice message'
-                    : sendTextMode
-                    ? s.send
-                    : 'Record voice message',
-              ),
-            ],
-          ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }

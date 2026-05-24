@@ -23,6 +23,10 @@ export type MessageView = {
   text: string;
   mediaUrl: string | null;
   durationMs: number | null;
+  replyToMessageId: string | null;
+  replyToText: string | null;
+  replyToSenderName: string | null;
+  replyToType: 'text' | 'voice' | null;
   deletedAt: string | null;
   editedAt: string | null;
   pinned: 0 | 1 | boolean;

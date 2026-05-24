@@ -25,7 +25,8 @@ const registerSchema = credentialsSchema.extend({
 });
 
 const textSchema = z.object({
-  text: z.string().trim().min(1).max(4000)
+  text: z.string().trim().min(1).max(4000),
+  replyToMessageId: z.string().trim().min(1).optional()
 });
 
 const reactionSchema = z.object({
@@ -206,6 +207,10 @@ function messageView(db: Db, messageId: string) {
            m.text,
            m.media_url AS mediaUrl,
            m.duration_ms AS durationMs,
+           m.reply_to_message_id AS replyToMessageId,
+           rm.text AS replyToText,
+           ru.display_name AS replyToSenderName,
+           rm.type AS replyToType,
            m.deleted_at AS deletedAt,
            m.edited_at AS editedAt,
            EXISTS(SELECT 1 FROM pinned_messages p WHERE p.chat_id = m.chat_id AND p.message_id = m.id) AS pinned,
@@ -213,6 +218,8 @@ function messageView(db: Db, messageId: string) {
            m.created_at AS createdAt
     FROM messages m
     JOIN users u ON u.id = m.sender_id
+    LEFT JOIN messages rm ON rm.id = m.reply_to_message_id AND rm.deleted_at IS NULL
+    LEFT JOIN users ru ON ru.id = rm.sender_id
     WHERE m.id = ?
   `).get(messageId) as Omit<MessageView, 'reactions'> | undefined;
   if (!message) return undefined;
@@ -229,6 +236,10 @@ function messageRows(db: Db, chatId: string, where = '', ...params: unknown[]) {
            m.text,
            m.media_url AS mediaUrl,
            m.duration_ms AS durationMs,
+           m.reply_to_message_id AS replyToMessageId,
+           rm.text AS replyToText,
+           ru.display_name AS replyToSenderName,
+           rm.type AS replyToType,
            m.deleted_at AS deletedAt,
            m.edited_at AS editedAt,
            EXISTS(SELECT 1 FROM pinned_messages p WHERE p.chat_id = m.chat_id AND p.message_id = m.id) AS pinned,
@@ -236,6 +247,8 @@ function messageRows(db: Db, chatId: string, where = '', ...params: unknown[]) {
            m.created_at AS createdAt
     FROM messages m
     JOIN users u ON u.id = m.sender_id
+    LEFT JOIN messages rm ON rm.id = m.reply_to_message_id AND rm.deleted_at IS NULL
+    LEFT JOIN users ru ON ru.id = rm.sender_id
     WHERE m.chat_id = ? ${where}
     ORDER BY m.created_at ASC
     LIMIT 200
@@ -590,10 +603,14 @@ export function buildApp(options: { db?: Db } = {}) {
     const { chatId } = z.object({ chatId: z.string() }).parse(request.params);
     const body = textSchema.parse(request.body);
     if (!hasChatAccess(db, chatId, user.id)) return reply.code(403).send({ error: 'forbidden' });
+    if (body.replyToMessageId) {
+      const replyTarget = db.prepare('SELECT id FROM messages WHERE id = ? AND chat_id = ? AND deleted_at IS NULL').get(body.replyToMessageId, chatId);
+      if (!replyTarget) return reply.code(404).send({ error: 'reply_message_not_found' });
+    }
     const messageId = id('msg');
     const settings = chatSettings(db, chatId);
     const autoDeleteAt = settings.autoDeleteSeconds === null ? null : new Date(Date.now() + settings.autoDeleteSeconds * 1000).toISOString();
-    db.prepare('INSERT INTO messages (id, chat_id, sender_id, type, text, auto_delete_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(messageId, chatId, user.id, 'text', body.text, autoDeleteAt, nowIso());
+    db.prepare('INSERT INTO messages (id, chat_id, sender_id, type, text, reply_to_message_id, auto_delete_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(messageId, chatId, user.id, 'text', body.text, body.replyToMessageId ?? null, autoDeleteAt, nowIso());
     const message = messageView(db, messageId);
     if (!message) throw new Error('message_not_created');
     const members = chatMembers(db, chatId);
