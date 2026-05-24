@@ -2931,6 +2931,9 @@ class _ChatPaneState extends State<ChatPane> {
   @override
   void initState() {
     super.initState();
+    text.addListener(() {
+      if (mounted) setState(() {});
+    });
     playerCompleteSub = voicePlayer.onPlayerComplete.listen((_) {
       if (mounted) setState(() => playingVoiceId = null);
     });
@@ -3009,6 +3012,17 @@ class _ChatPaneState extends State<ChatPane> {
     clearSelection();
   }
 
+  Future<void> copyMessage(ChatMessage message) async {
+    if (message.text.trim().isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: message.text));
+  }
+
+  Future<void> deleteMessage(ChatMessage message) async {
+    await widget.onDeleteMessages([message]);
+    selectedIds.remove(message.id);
+    if (mounted) setState(() {});
+  }
+
   void startEdit(ChatMessage message) {
     if (message.senderId != widget.user.id || message.voiceUrl != null) return;
     setState(() {
@@ -3040,6 +3054,88 @@ class _ChatPaneState extends State<ChatPane> {
       ),
     );
     if (reaction != null) await widget.onReactToMessage(message, reaction);
+  }
+
+  Future<void> showMessageMenu(ChatMessage message, Offset position) async {
+    final mine = message.senderId == widget.user.id;
+    final action = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        if (message.text.trim().isNotEmpty)
+          const PopupMenuItem(
+            value: 'copy',
+            child: ListTile(
+              leading: Icon(Icons.copy),
+              title: Text('Copy'),
+              dense: true,
+            ),
+          ),
+        const PopupMenuItem(
+          value: 'react',
+          child: ListTile(
+            leading: Icon(Icons.add_reaction_outlined),
+            title: Text('React'),
+            dense: true,
+          ),
+        ),
+        PopupMenuItem(
+          value: 'pin',
+          child: ListTile(
+            leading: Icon(
+              message.pinned ? Icons.push_pin : Icons.push_pin_outlined,
+            ),
+            title: Text(message.pinned ? 'Unpin' : 'Pin'),
+            dense: true,
+          ),
+        ),
+        if (mine && message.voiceUrl == null)
+          const PopupMenuItem(
+            value: 'edit',
+            child: ListTile(
+              leading: Icon(Icons.edit_outlined),
+              title: Text('Edit'),
+              dense: true,
+            ),
+          ),
+        const PopupMenuItem(
+          value: 'select',
+          child: ListTile(
+            leading: Icon(Icons.check_circle_outline),
+            title: Text('Select'),
+            dense: true,
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'delete',
+          child: ListTile(
+            leading: Icon(Icons.delete_outline),
+            title: Text('Delete'),
+            dense: true,
+          ),
+        ),
+      ],
+    );
+    if (!mounted || action == null) return;
+    switch (action) {
+      case 'copy':
+        await copyMessage(message);
+      case 'react':
+        await pickReaction(message);
+      case 'pin':
+        await widget.onSetMessagePinned(message, !message.pinned);
+      case 'edit':
+        startEdit(message);
+      case 'select':
+        toggleSelection(message);
+      case 'delete':
+        await deleteMessage(message);
+    }
   }
 
   Future<void> showAutoDeleteSettings() async {
@@ -3262,6 +3358,8 @@ class _ChatPaneState extends State<ChatPane> {
         .toList();
     final selectedMine =
         selected.length == 1 && selected.first.senderId == widget.user.id;
+    final hasText = text.text.trim().isNotEmpty;
+    final sendTextMode = hasText || editingMessage != null;
     return Column(
       children: [
         Container(
@@ -3449,7 +3547,10 @@ class _ChatPaneState extends State<ChatPane> {
               return Align(
                 alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
                 child: GestureDetector(
-                  onLongPress: () => toggleSelection(message),
+                  onLongPressStart: (details) =>
+                      showMessageMenu(message, details.globalPosition),
+                  onSecondaryTapDown: (details) =>
+                      showMessageMenu(message, details.globalPosition),
                   onTap: selectedIds.isEmpty
                       ? null
                       : () => toggleSelection(message),
@@ -3512,64 +3613,6 @@ class _ChatPaneState extends State<ChatPane> {
                           alignment: Alignment.centerRight,
                           child: messageMeta(context, message, mine),
                         ),
-                        const SizedBox(height: 2),
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              constraints: const BoxConstraints.tightFor(
-                                width: 34,
-                                height: 34,
-                              ),
-                              padding: EdgeInsets.zero,
-                              visualDensity: VisualDensity.compact,
-                              onPressed: () => pickReaction(message),
-                              icon: const Icon(
-                                Icons.add_reaction_outlined,
-                                size: 18,
-                              ),
-                              color: mine
-                                  ? Colors.white.withValues(alpha: 0.72)
-                                  : null,
-                              tooltip: 'React',
-                            ),
-                            IconButton(
-                              constraints: const BoxConstraints.tightFor(
-                                width: 34,
-                                height: 34,
-                              ),
-                              padding: EdgeInsets.zero,
-                              visualDensity: VisualDensity.compact,
-                              onPressed: () => widget.onSetMessagePinned(
-                                message,
-                                !message.pinned,
-                              ),
-                              icon: Icon(
-                                message.pinned
-                                    ? Icons.push_pin
-                                    : Icons.push_pin_outlined,
-                                size: 18,
-                              ),
-                              color: mine
-                                  ? Colors.white.withValues(alpha: 0.72)
-                                  : null,
-                              tooltip: message.pinned ? 'Unpin' : 'Pin',
-                            ),
-                            if (mine && message.voiceUrl == null)
-                              IconButton(
-                                constraints: const BoxConstraints.tightFor(
-                                  width: 34,
-                                  height: 34,
-                                ),
-                                padding: EdgeInsets.zero,
-                                visualDensity: VisualDensity.compact,
-                                onPressed: () => startEdit(message),
-                                icon: const Icon(Icons.edit_outlined, size: 18),
-                                color: Colors.white.withValues(alpha: 0.72),
-                                tooltip: 'Edit',
-                              ),
-                          ],
-                        ),
                       ],
                     ),
                   ),
@@ -3606,16 +3649,14 @@ class _ChatPaneState extends State<ChatPane> {
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
           child: Row(
             children: [
-              IconButton.filledTonal(
-                onPressed: recordingVoice
-                    ? () => stopVoiceRecord(send: false)
-                    : startVoiceRecord,
-                icon: Icon(recordingVoice ? Icons.close : Icons.mic),
-                tooltip: recordingVoice
-                    ? 'Cancel voice message'
-                    : 'Record voice message',
-              ),
-              const SizedBox(width: 8),
+              if (recordingVoice) ...[
+                IconButton.filledTonal(
+                  onPressed: () => stopVoiceRecord(send: false),
+                  icon: const Icon(Icons.close),
+                  tooltip: 'Cancel voice message',
+                ),
+                const SizedBox(width: 8),
+              ],
               Expanded(
                 child: recordingVoice
                     ? Text(
@@ -3639,9 +3680,21 @@ class _ChatPaneState extends State<ChatPane> {
               IconButton.filled(
                 onPressed: recordingVoice
                     ? () => stopVoiceRecord(send: true)
-                    : submit,
-                icon: Icon(recordingVoice ? Icons.check : Icons.send),
-                tooltip: recordingVoice ? 'Send voice message' : s.send,
+                    : sendTextMode
+                    ? submit
+                    : startVoiceRecord,
+                icon: Icon(
+                  recordingVoice
+                      ? Icons.check
+                      : sendTextMode
+                      ? Icons.send
+                      : Icons.mic,
+                ),
+                tooltip: recordingVoice
+                    ? 'Send voice message'
+                    : sendTextMode
+                    ? s.send
+                    : 'Record voice message',
               ),
             ],
           ),
