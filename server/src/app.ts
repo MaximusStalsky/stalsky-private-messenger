@@ -792,6 +792,17 @@ export function buildApp(options: { db?: Db } = {}) {
     return { pins };
   });
 
+  app.delete('/api/chats/:chatId/pins', async (request, reply) => {
+    const user = await requireUser(request, reply, db);
+    if (!user) return;
+    const { chatId } = z.object({ chatId: z.string() }).parse(request.params);
+    if (!hasChatAccess(db, chatId, user.id)) return reply.code(403).send({ error: 'forbidden' });
+    db.prepare('DELETE FROM pinned_messages WHERE chat_id = ?').run(chatId);
+    const pins: any[] = [];
+    broadcastToUsers(chatMembers(db, chatId), { type: 'message.pinned', chatId, pins });
+    return { pins };
+  });
+
   app.get('/api/chats/:chatId/settings', async (request, reply) => {
     const user = await requireUser(request, reply, db);
     if (!user) return;

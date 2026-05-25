@@ -309,6 +309,9 @@ describe('contacts, chats, and messages', () => {
     const unpinned = await authDelete(max.token, `/api/chats/${encodeURIComponent(chatId)}/pins/${encodeURIComponent(messageIds[0])}`);
     expect(unpinned.statusCode).toBe(200);
     expect(unpinned.json().pins).toHaveLength(2);
+    const clearedPins = await authDelete(max.token, `/api/chats/${encodeURIComponent(chatId)}/pins`);
+    expect(clearedPins.statusCode).toBe(200);
+    expect(clearedPins.json().pins).toHaveLength(0);
 
     const settings = await authPatch(max.token, `/api/chats/${encodeURIComponent(chatId)}/settings`, { autoDeleteSeconds: 60 });
     expect(settings.statusCode).toBe(200);

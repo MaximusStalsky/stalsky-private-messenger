@@ -368,6 +368,10 @@ class ApiClient {
     );
   }
 
+  Future<Map<String, dynamic>> clearPinnedMessages(String chatId) {
+    return delete('/api/chats/${Uri.encodeComponent(chatId)}/pins');
+  }
+
   Future<List<ChatMessage>> searchMessages(String chatId, String query) async {
     final data = await getJson(
       '/api/chats/${Uri.encodeComponent(chatId)}/messages/search',
@@ -764,6 +768,7 @@ class ChatMessage {
     this.pinned = false,
     this.readByPeer = false,
     this.reactions = const {},
+    this.reactionUsers = const {},
     this.voiceUrl,
     this.voiceDurationSeconds,
     this.localVoicePath,
@@ -783,6 +788,7 @@ class ChatMessage {
   final bool pinned;
   final bool readByPeer;
   final Map<String, int> reactions;
+  final Map<String, List<String>> reactionUsers;
   final String? voiceUrl;
   final int? voiceDurationSeconds;
   final String? localVoicePath;
@@ -809,6 +815,7 @@ class ChatMessage {
         json['readByPeer'] == 1 ||
         json['isRead'] == true,
     reactions: _parseReactions(json['reactions']),
+    reactionUsers: _parseReactionUsers(json['reactions']),
     voiceUrl:
         json['voiceUrl'] as String? ??
         json['audioUrl'] as String? ??
@@ -832,6 +839,7 @@ class ChatMessage {
     bool? pinned,
     bool? readByPeer,
     Map<String, int>? reactions,
+    Map<String, List<String>>? reactionUsers,
     String? voiceUrl,
     int? voiceDurationSeconds,
     String? localVoicePath,
@@ -851,6 +859,7 @@ class ChatMessage {
     pinned: pinned ?? this.pinned,
     readByPeer: readByPeer ?? this.readByPeer,
     reactions: reactions ?? this.reactions,
+    reactionUsers: reactionUsers ?? this.reactionUsers,
     voiceUrl: voiceUrl ?? this.voiceUrl,
     voiceDurationSeconds: voiceDurationSeconds ?? this.voiceDurationSeconds,
     localVoicePath: localVoicePath ?? this.localVoicePath,
@@ -860,6 +869,12 @@ class ChatMessage {
     replyToSenderName: replyToSenderName ?? this.replyToSenderName,
     replyToType: replyToType ?? this.replyToType,
   );
+}
+
+class MessageReaction {
+  const MessageReaction({required this.count, this.userIds = const []});
+  final int count;
+  final List<String> userIds;
 }
 
 Map<String, int> _parseReactions(dynamic value) {
@@ -873,6 +888,23 @@ Map<String, int> _parseReactions(dynamic value) {
         final reaction = item['reaction']?.toString();
         final count = item['count'];
         if (reaction != null && count is num) result[reaction] = count.toInt();
+      }
+    }
+    return result;
+  }
+  return const {};
+}
+
+Map<String, List<String>> _parseReactionUsers(dynamic value) {
+  if (value is List) {
+    final result = <String, List<String>>{};
+    for (final item in value) {
+      if (item is Map<String, dynamic>) {
+        final reaction = item['reaction']?.toString();
+        final users = item['userIds'];
+        if (reaction != null && users is List) {
+          result[reaction] = users.map((item) => item.toString()).toList();
+        }
       }
     }
     return result;
@@ -1735,6 +1767,12 @@ class _MessengerHomeState extends State<MessengerHome>
     }
   }
 
+  Future<void> clearPinnedMessages(String chatId) async {
+    await api.clearPinnedMessages(chatId);
+    await loadMessagesForChat(chatId);
+    if (mounted) setState(() {});
+  }
+
   Future<List<ChatMessage>> searchMessages(String query) async {
     final chat = selectedChat;
     if (chat == null || query.trim().isEmpty) return const [];
@@ -1833,6 +1871,7 @@ class _MessengerHomeState extends State<MessengerHome>
       onDeleteMessages: deleteSelectedMessages,
       onReactToMessage: reactToMessage,
       onSetMessagePinned: setMessagePinned,
+      onClearPinnedMessages: clearPinnedMessages,
       onSearchMessages: searchMessages,
       onSetAutoDeleteSeconds: setAutoDeleteSeconds,
       onSendVoiceMessage: sendVoiceMessage,
@@ -2018,6 +2057,7 @@ class AppShell extends StatefulWidget {
     required this.onDeleteMessages,
     required this.onReactToMessage,
     required this.onSetMessagePinned,
+    required this.onClearPinnedMessages,
     required this.onSearchMessages,
     required this.onSetAutoDeleteSeconds,
     required this.onSendVoiceMessage,
@@ -2058,6 +2098,7 @@ class AppShell extends StatefulWidget {
   onReactToMessage;
   final Future<void> Function(ChatMessage message, bool pinned)
   onSetMessagePinned;
+  final Future<void> Function(String chatId) onClearPinnedMessages;
   final Future<List<ChatMessage>> Function(String query) onSearchMessages;
   final Future<void> Function(int seconds) onSetAutoDeleteSeconds;
   final Future<void> Function(String path, int durationSeconds)
@@ -2116,6 +2157,7 @@ class _AppShellState extends State<AppShell> {
       onDeleteMessages: widget.onDeleteMessages,
       onReactToMessage: widget.onReactToMessage,
       onSetMessagePinned: widget.onSetMessagePinned,
+      onClearPinnedMessages: widget.onClearPinnedMessages,
       onSearchMessages: widget.onSearchMessages,
       onSetAutoDeleteSeconds: widget.onSetAutoDeleteSeconds,
       onSendVoiceMessage: widget.onSendVoiceMessage,
@@ -2962,6 +3004,7 @@ class ChatPane extends StatefulWidget {
     required this.onDeleteMessages,
     required this.onReactToMessage,
     required this.onSetMessagePinned,
+    required this.onClearPinnedMessages,
     required this.onSearchMessages,
     required this.onSetAutoDeleteSeconds,
     required this.onSendVoiceMessage,
@@ -2981,6 +3024,7 @@ class ChatPane extends StatefulWidget {
   onReactToMessage;
   final Future<void> Function(ChatMessage message, bool pinned)
   onSetMessagePinned;
+  final Future<void> Function(String chatId) onClearPinnedMessages;
   final Future<List<ChatMessage>> Function(String query) onSearchMessages;
   final Future<void> Function(int seconds) onSetAutoDeleteSeconds;
   final Future<void> Function(String path, int durationSeconds)
@@ -3021,7 +3065,7 @@ class _ChatPaneState extends State<ChatPane> {
       if (mounted) setState(() => playingVoiceId = null);
     });
     WidgetsBinding.instance.addPostFrameCallback(
-      (_) => scrollToBottom(jump: true),
+      (_) => scheduleScrollToBottom(),
     );
   }
 
@@ -3042,9 +3086,19 @@ class _ChatPaneState extends State<ChatPane> {
     if (widget.chat?.id != oldWidget.chat?.id ||
         widget.messages.length != oldWidget.messages.length) {
       WidgetsBinding.instance.addPostFrameCallback(
-        (_) => scrollToBottom(jump: true),
+        (_) => scheduleScrollToBottom(),
       );
     }
+  }
+
+  void scheduleScrollToBottom() {
+    scrollToBottom(jump: true);
+    Future.delayed(const Duration(milliseconds: 60), () {
+      if (mounted) scrollToBottom(jump: true);
+    });
+    Future.delayed(const Duration(milliseconds: 180), () {
+      if (mounted) scrollToBottom(jump: true);
+    });
   }
 
   void scrollToBottom({bool jump = false}) {
@@ -3557,6 +3611,63 @@ class _ChatPaneState extends State<ChatPane> {
     );
   }
 
+  Widget buildReactionPill(
+    BuildContext context,
+    ChatMessage message,
+    MapEntry<String, int> entry,
+    bool mine,
+  ) {
+    final scheme = Theme.of(context).colorScheme;
+    final userIds = message.reactionUsers[entry.key] ?? const <String>[];
+    final showPeerAvatar = userIds.contains(widget.chat?.peerId);
+    final showOwnAvatar = userIds.contains(widget.user.id);
+    final avatarName = showPeerAvatar
+        ? widget.chat?.peerDisplayName ?? ''
+        : widget.user.displayName;
+    final avatarUrl = showPeerAvatar
+        ? widget.chat?.peerAvatarUrl
+        : widget.user.avatarUrl;
+    final pillColor = mine
+        ? Colors.white.withValues(alpha: 0.16)
+        : scheme.surface.withValues(alpha: 0.78);
+    final borderColor = mine
+        ? Colors.white.withValues(alpha: 0.22)
+        : const Color(0xFF54B7F3).withValues(alpha: 0.32);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(6, 2, 5, 2),
+      decoration: BoxDecoration(
+        color: pillColor,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: borderColor),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(entry.key, style: const TextStyle(fontSize: 14)),
+          if (entry.value > 1) ...[
+            const SizedBox(width: 3),
+            Text(
+              entry.value.toString(),
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: mine ? Colors.white : scheme.onSurface,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+          if (showPeerAvatar || showOwnAvatar) ...[
+            const SizedBox(width: 4),
+            UserAvatar(
+              apiBaseUrl: widget.apiBaseUrl,
+              name: avatarName,
+              avatarUrl: avatarUrl,
+              radius: 8,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final chat = widget.chat;
@@ -3764,9 +3875,9 @@ class _ChatPaneState extends State<ChatPane> {
                   ),
                   IconButton(
                     onPressed: () async =>
-                        widget.onSetMessagePinned(pinned.first, false),
+                        widget.onClearPinnedMessages(chat.id),
                     icon: const Icon(Icons.close, size: 18),
-                    tooltip: 'Unpin',
+                    tooltip: 'Clear pinned messages',
                   ),
                 ],
               ),
@@ -3882,14 +3993,14 @@ class _ChatPaneState extends State<ChatPane> {
                                   padding: const EdgeInsets.only(top: 6),
                                   child: Wrap(
                                     spacing: 4,
+                                    runSpacing: 4,
                                     children: message.reactions.entries
                                         .map(
-                                          (entry) => Chip(
-                                            label: Text(
-                                              '${entry.key} ${entry.value}',
-                                            ),
-                                            visualDensity:
-                                                VisualDensity.compact,
+                                          (entry) => buildReactionPill(
+                                            context,
+                                            message,
+                                            entry,
+                                            mine,
                                           ),
                                         )
                                         .toList(),
@@ -4028,6 +4139,12 @@ class _ChatPaneState extends State<ChatPane> {
                         : sendTextMode
                         ? Icons.send
                         : Icons.mic,
+                  ),
+                  style: IconButton.styleFrom(
+                    backgroundColor: const Color(
+                      0xFF229ED9,
+                    ).withValues(alpha: 0.9),
+                    foregroundColor: Colors.white,
                   ),
                   tooltip: recordingVoice
                       ? 'Send voice message'
