@@ -374,6 +374,31 @@ export function buildApp(options: { db?: Db } = {}) {
 
   app.get('/api/push/status', async () => ({ configured: pushConfigured() }));
 
+  app.get('/uploads/*', async (request, reply) => {
+    const wildcard = (request.params as { '*': string })['*'];
+    const resolved = path.resolve(uploadsDir, wildcard);
+    const root = path.resolve(uploadsDir);
+    if (!resolved.startsWith(root + path.sep) || !fs.existsSync(resolved)) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    const extension = path.extname(resolved).toLowerCase();
+    const contentTypeByExtension: Record<string, string> = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+      '.m4a': 'audio/mp4',
+      '.mp4': 'audio/mp4',
+      '.aac': 'audio/aac',
+      '.mp3': 'audio/mpeg',
+      '.ogg': 'audio/ogg',
+      '.webm': 'audio/webm',
+      '.wav': 'audio/wav'
+    };
+    reply.type(contentTypeByExtension[extension] ?? 'application/octet-stream');
+    return reply.send(fs.createReadStream(resolved));
+  });
+
   app.post('/api/invites', async (request, reply) => {
     const body = z.object({ code: z.string().trim().min(3).max(64).optional(), maxUses: z.number().int().min(1).max(100).optional() }).parse(request.body ?? {});
     const code = body.code ?? crypto.randomUUID().slice(0, 8);
@@ -819,13 +844,6 @@ export function buildApp(options: { db?: Db } = {}) {
       broadcastPresence(db, user.id, true);
       socket.send(JSON.stringify({ type: 'connected', userId: user.id }));
     });
-  });
-
-  app.register(staticPlugin, {
-    root: uploadsDir,
-    prefix: '/uploads/',
-    decorateReply: false,
-    wildcard: false
   });
 
   const publicDir = path.join(process.cwd(), '..', 'apps', 'messenger_app', 'build', 'web');

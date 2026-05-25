@@ -345,6 +345,9 @@ describe('contacts, chats, and messages', () => {
     expect(message.durationMs).toBe(1234);
     expect(message.mediaUrl).toMatch(/^\/uploads\/voices\/msg_.*\.webm$/);
     expect(fs.existsSync(path.join(uploadsDir, 'voices', path.basename(message.mediaUrl)))).toBe(true);
+    const downloaded = await app.inject({ method: 'GET', url: message.mediaUrl });
+    expect(downloaded.statusCode).toBe(200);
+    expect(Buffer.compare(downloaded.rawPayload, bytes)).toBe(0);
   });
 
   it('broadcasts websocket events for updates, deletes, reactions, pins, and settings', async () => {

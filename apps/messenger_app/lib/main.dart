@@ -952,6 +952,7 @@ class _MessengerHomeState extends State<MessengerHome>
   final contacts = <UserProfile>[];
   final chats = <ChatSummary>[];
   final messages = <String, List<ChatMessage>>{};
+  final pendingVoicePaths = <String, List<String>>{};
   ChatSummary? selectedChat;
   WebSocketChannel? channel;
   StreamSubscription? socketSub;
@@ -1068,12 +1069,7 @@ class _MessengerHomeState extends State<MessengerHome>
         final message = ChatMessage.fromJson(
           data['message'] as Map<String, dynamic>,
         );
-        setState(() {
-          messages.putIfAbsent(message.chatId, () => []);
-          if (!messages[message.chatId]!.any((item) => item.id == message.id)) {
-            messages[message.chatId]!.add(message);
-          }
-        });
+        mergeIncomingMessage(message);
         if (message.senderId != currentUser?.id &&
             lifecycleState == AppLifecycleState.resumed) {
           notifications.showIncoming(widget.strings, message);
@@ -1172,6 +1168,48 @@ class _MessengerHomeState extends State<MessengerHome>
       } else {
         list[index] = message;
       }
+    });
+  }
+
+  void mergeIncomingMessage(ChatMessage message) {
+    setState(() {
+      final list = messages.putIfAbsent(message.chatId, () => []);
+      final existingIndex = list.indexWhere((item) => item.id == message.id);
+      if (existingIndex != -1) {
+        pendingVoicePaths[message.chatId]?.remove(
+          list[existingIndex].localVoicePath,
+        );
+        list[existingIndex] = message.copyWith(
+          localVoicePath: list[existingIndex].localVoicePath,
+          uploading: false,
+        );
+        return;
+      }
+      if (message.senderId == currentUser?.id && message.voiceUrl != null) {
+        final localIndex = list.indexWhere(
+          (item) =>
+              item.id.startsWith('local_') &&
+              item.senderId == message.senderId &&
+              item.voiceUrl == null &&
+              item.localVoicePath != null,
+        );
+        if (localIndex != -1) {
+          final localPath = list[localIndex].localVoicePath;
+          pendingVoicePaths[message.chatId]?.remove(localPath);
+          list[localIndex] = message.copyWith(
+            localVoicePath: localPath,
+            uploading: false,
+          );
+          return;
+        }
+        final pending = pendingVoicePaths[message.chatId];
+        final localPath = pending == null || pending.isEmpty
+            ? null
+            : pending.removeAt(0);
+        list.add(message.copyWith(localVoicePath: localPath, uploading: false));
+        return;
+      }
+      list.add(message);
     });
   }
 
@@ -1588,14 +1626,18 @@ class _MessengerHomeState extends State<MessengerHome>
 
   Future<void> openChat(ChatSummary chat) async {
     selectedChat = chat;
-    final data = await api.getJson(
-      '/api/chats/${Uri.encodeComponent(chat.id)}/messages',
-    );
-    messages[chat.id] = (data['messages'] as List)
-        .map((item) => ChatMessage.fromJson(item as Map<String, dynamic>))
-        .toList();
+    await loadMessagesForChat(chat.id);
     await markSelectedChatRead();
     if (mounted) setState(() {});
+  }
+
+  Future<void> loadMessagesForChat(String chatId) async {
+    final data = await api.getJson(
+      '/api/chats/${Uri.encodeComponent(chatId)}/messages',
+    );
+    messages[chatId] = (data['messages'] as List)
+        .map((item) => ChatMessage.fromJson(item as Map<String, dynamic>))
+        .toList();
   }
 
   Future<void> markSelectedChatRead() async {
@@ -1686,26 +1728,10 @@ class _MessengerHomeState extends State<MessengerHome>
   }
 
   Future<void> setMessagePinned(ChatMessage message, bool pinned) async {
-    final data = await api.setMessagePinned(message.chatId, message.id, pinned);
-    final updated = data['message'];
-    if (updated is Map<String, dynamic>) {
-      replaceLocalMessage(ChatMessage.fromJson(updated));
-    } else if (data['pins'] is List) {
-      final pinIds = (data['pins'] as List)
-          .whereType<Map<String, dynamic>>()
-          .map((pin) => pin['messageId']?.toString())
-          .whereType<String>()
-          .toSet();
-      setState(() {
-        final list = messages[message.chatId];
-        if (list == null) return;
-        messages[message.chatId] = [
-          for (final item in list)
-            item.copyWith(pinned: pinIds.contains(item.id)),
-        ];
-      });
-    } else {
-      replaceLocalMessage(message.copyWith(pinned: pinned));
+    await api.setMessagePinned(message.chatId, message.id, pinned);
+    await loadMessagesForChat(message.chatId);
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -1738,6 +1764,7 @@ class _MessengerHomeState extends State<MessengerHome>
     );
     messages.putIfAbsent(chat.id, () => []);
     messages[chat.id]!.add(localMessage);
+    pendingVoicePaths.putIfAbsent(chat.id, () => []).add(path);
     if (mounted) setState(() {});
     try {
       final bytes = await XFile(path).readAsBytes();
@@ -1749,15 +1776,7 @@ class _MessengerHomeState extends State<MessengerHome>
       final message = ChatMessage.fromJson(
         data['message'] as Map<String, dynamic>,
       ).copyWith(localVoicePath: path, uploading: false);
-      setState(() {
-        final list = messages[chat.id]!;
-        final index = list.indexWhere((item) => item.id == localId);
-        if (index == -1) {
-          list.add(message);
-        } else {
-          list[index] = message;
-        }
-      });
+      mergeIncomingMessage(message);
       await loadChats();
     } catch (_) {
       replaceLocalMessage(localMessage.copyWith(uploading: false));
@@ -3348,23 +3367,32 @@ class _ChatPaneState extends State<ChatPane> {
     await voicePlayer.stop();
     final localPath = message.localVoicePath;
     if (!kIsWeb && localPath != null && localPath.isNotEmpty) {
-      await voicePlayer.play(DeviceFileSource(localPath));
-      setState(() => playingVoiceId = message.id);
-      return;
+      try {
+        await voicePlayer.play(DeviceFileSource(localPath));
+        setState(() => playingVoiceId = message.id);
+        return;
+      } catch (_) {
+        // Fall through to the server copy if the temporary local file vanished.
+      }
     }
     final url = mediaUrl(widget.apiBaseUrl, message.voiceUrl);
     if (url.isEmpty) return;
-    final response = await http.get(Uri.parse(url));
-    if (response.statusCode >= 400 || response.bodyBytes.isEmpty) return;
-    if (kIsWeb) {
-      await voicePlayer.play(BytesSource(response.bodyBytes));
-    } else {
-      final directory = await getTemporaryDirectory();
-      final segments = Uri.parse(url).pathSegments;
-      final safeName = segments.isEmpty ? '${message.id}.m4a' : segments.last;
-      final path = '${directory.path}/play_$safeName';
-      await XFile.fromData(response.bodyBytes).saveTo(path);
-      await voicePlayer.play(DeviceFileSource(path));
+    try {
+      await voicePlayer.play(UrlSource(url));
+    } catch (_) {
+      final response = await http.get(Uri.parse(url));
+      if (response.statusCode >= 400 || response.bodyBytes.isEmpty) return;
+      try {
+        await voicePlayer.play(BytesSource(response.bodyBytes));
+      } catch (_) {
+        if (kIsWeb) return;
+        final directory = await getTemporaryDirectory();
+        final segments = Uri.parse(url).pathSegments;
+        final safeName = segments.isEmpty ? '${message.id}.m4a' : segments.last;
+        final path = '${directory.path}/play_$safeName';
+        await XFile.fromData(response.bodyBytes).saveTo(path);
+        await voicePlayer.play(DeviceFileSource(path));
+      }
     }
     setState(() => playingVoiceId = message.id);
   }
@@ -3723,7 +3751,8 @@ class _ChatPaneState extends State<ChatPane> {
                                 ),
                           ),
                           Text(
-                            pinned.first.voiceUrl != null
+                            pinned.first.voiceUrl != null ||
+                                    pinned.first.localVoicePath != null
                                 ? 'Voice message'
                                 : pinned.first.text,
                             maxLines: 1,
@@ -3836,7 +3865,8 @@ class _ChatPaneState extends State<ChatPane> {
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               buildReplyPreview(context, message, mine),
-                              if (message.voiceUrl != null)
+                              if (message.voiceUrl != null ||
+                                  message.localVoicePath != null)
                                 buildVoiceMessage(context, message, mine)
                               else
                                 Text(
@@ -3922,7 +3952,8 @@ class _ChatPaneState extends State<ChatPane> {
                           style: const TextStyle(fontWeight: FontWeight.w700),
                         ),
                         Text(
-                          replyingTo!.voiceUrl != null
+                          replyingTo!.voiceUrl != null ||
+                                  replyingTo!.localVoicePath != null
                               ? 'Voice message'
                               : replyingTo!.text,
                           maxLines: 1,
