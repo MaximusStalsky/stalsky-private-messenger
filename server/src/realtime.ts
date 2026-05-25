@@ -44,7 +44,16 @@ export function broadcastToUsers(userIds: string[], event: unknown) {
   const allowed = new Set(userIds);
   for (const client of clients) {
     if (allowed.has(client.userId) && client.socket.readyState === 1) {
-      client.socket.send(payload);
+      try {
+        client.socket.send(payload);
+      } catch {
+        clients.delete(client);
+        try {
+          client.socket.close();
+        } catch {
+          // Ignore cleanup failures; a stale realtime client must not fail the API request.
+        }
+      }
     }
   }
 }

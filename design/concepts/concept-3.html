@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>My Messenger Concept 3 - Mineral Green</title>
+  <style>
+    :root {
+      --page: #18201d;
+      --phone: #f3f4ef;
+      --surface: rgba(250,251,247,.90);
+      --text: #18201d;
+      --muted: #687269;
+      --line: rgba(24,32,29,.10);
+      --accent: #2f8f7a;
+      --accent-2: #d05f45;
+      --incoming: #ffffff;
+      --outgoing: #d8eee6;
+      --reply: rgba(47,143,122,.10);
+      --shadow: 0 24px 60px rgba(6,18,15,.30);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: linear-gradient(180deg, #24332f, #151d1a); color: var(--text); }
+    .stage { width: min(100vw, 430px); min-height: 100vh; padding: 18px; display: grid; place-items: center; }
+    .phone {
+      width: min(100%, 390px); height: min(844px, calc(100vh - 36px)); min-height: 720px;
+      border-radius: 30px; overflow: hidden; position: relative; background: var(--phone);
+      box-shadow: var(--shadow); border: 1px solid rgba(255,255,255,.16);
+    }
+    .header { height: 74px; display: flex; align-items: center; gap: 10px; padding: 12px; background: var(--surface); backdrop-filter: blur(18px); border-bottom: 1px solid var(--line); }
+    .icon { width: 38px; height: 38px; border-radius: 19px; border: 0; background: transparent; display: grid; place-items: center; color: #22312d; font-size: 20px; }
+    .icon.filled { background: rgba(47,143,122,.12); color: var(--accent); }
+    .avatar {
+      width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; color: white; font-weight: 800;
+      background: linear-gradient(145deg, #5bb9a4, #2f8f7a 55%, #1d564d);
+      border: 2px solid #f3f4ef; box-shadow: 0 0 0 2px rgba(208,95,69,.78);
+    }
+    .title { flex: 1; min-width: 0; }
+    .name { font-weight: 760; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .status { color: var(--accent); font-size: 12px; margin-top: 2px; }
+    .pinned { height: 58px; display: flex; align-items: center; gap: 10px; padding: 8px 12px 8px 16px; background: rgba(226,239,234,.84); border-bottom: 1px solid var(--line); animation: pinIn 380ms cubic-bezier(.2,.8,.2,1); }
+    .pin-line { width: 3px; height: 40px; border-radius: 6px; background: var(--accent-2); }
+    .pin-copy { flex: 1; min-width: 0; }
+    .pin-copy strong { color: var(--accent); font-size: 12px; display: block; }
+    .pin-copy span { color: var(--muted); font-size: 13px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .messages { height: calc(100% - 74px - 58px - 82px); padding: 16px 14px 10px; display: flex; flex-direction: column; gap: 8px; overflow: hidden; }
+    .bubble { max-width: 78%; padding: 8px 10px 6px; border-radius: 18px; font-size: 14px; line-height: 1.34; box-shadow: 0 8px 20px rgba(35,48,43,.10); animation: messageIn 340ms cubic-bezier(.2,.8,.2,1) both; }
+    .in { align-self: flex-start; background: var(--incoming); border-bottom-left-radius: 6px; border: 1px solid var(--line); }
+    .out { align-self: flex-end; background: var(--outgoing); border-bottom-right-radius: 6px; }
+    .wide { width: 78%; } .mid { width: 61%; } .short { width: 47%; }
+    .reply { margin-bottom: 7px; padding: 6px 8px; border-radius: 9px; border-left: 3px solid var(--accent-2); background: var(--reply); color: #526159; font-size: 12px; }
+    .reply b { color: var(--accent); display: block; margin-bottom: 1px; }
+    .meta { display: flex; justify-content: flex-end; align-items: center; gap: 4px; margin-top: 4px; color: #687269; font-size: 11px; }
+    .ticks { color: var(--accent); font-weight: 800; }
+    .reaction { width: max-content; margin-top: 7px; padding: 2px 6px; border-radius: 14px; border: 1px solid rgba(47,143,122,.20); background: rgba(255,255,255,.64); font-size: 12px; animation: react 460ms ease-out; }
+    .voice { display: flex; align-items: center; gap: 10px; }
+    .play { width: 34px; height: 34px; border-radius: 17px; display: grid; place-items: center; color: white; background: var(--accent); }
+    .wave { flex: 1; height: 26px; display: flex; align-items: center; gap: 3px; }
+    .wave i { width: 3px; border-radius: 3px; background: var(--accent); animation: voice 1250ms ease-in-out infinite; }
+    .wave i:nth-child(1){height:8px}.wave i:nth-child(2){height:17px;animation-delay:70ms}.wave i:nth-child(3){height:12px;animation-delay:140ms}.wave i:nth-child(4){height:22px;animation-delay:210ms}.wave i:nth-child(5){height:10px;animation-delay:280ms}.wave i:nth-child(6){height:18px;animation-delay:350ms}.wave i:nth-child(7){height:14px;animation-delay:420ms}
+    .composer { height: 82px; padding: 9px 12px 14px; display: flex; align-items: center; gap: 10px; background: linear-gradient(180deg, transparent, rgba(243,244,239,.78)); }
+    .input { min-width: 0; flex: 1; height: 48px; border-radius: 24px; display: flex; align-items: center; gap: 10px; padding: 0 14px; background: rgba(255,255,255,.86); border: 1px solid var(--line); color: var(--muted); box-shadow: 0 10px 24px rgba(35,48,43,.08); }
+    .send { width: 48px; height: 48px; border-radius: 24px; display: grid; place-items: center; color: white; background: var(--accent-2); box-shadow: 0 10px 24px rgba(208,95,69,.20); font-size: 19px; }
+    @keyframes messageIn { from { opacity: 0; transform: translateY(10px) scale(.99); } to { opacity: 1; transform: none; } }
+    @keyframes pinIn { from { opacity: 0; transform: translateY(-16px); } to { opacity: 1; transform: none; } }
+    @keyframes react { 0% { transform: scale(.74); } 70% { transform: scale(1.06); } 100% { transform: scale(1); } }
+    @keyframes voice { 50% { opacity: .45; transform: scaleY(.72); } }
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <section class="phone" aria-label="Mineral green chat concept">
+      <header class="header">
+        <button class="icon" aria-label="Back">‹</button><div class="avatar">M</div>
+        <div class="title"><div class="name">Maria Stalsky</div><div class="status">online</div></div>
+        <button class="icon filled" aria-label="Call">☎</button><button class="icon" aria-label="Menu">⋮</button>
+      </header>
+      <div class="pinned"><div class="pin-line"></div><div>⌖</div><div class="pin-copy"><strong>Pinned message</strong><span>Meet by the south entrance, not the main hall.</span></div><button class="icon" aria-label="Unpin">×</button></div>
+      <section class="messages">
+        <article class="bubble in mid">I am leaving in ten minutes. Need anything?<div class="meta">16:08</div></article>
+        <article class="bubble out wide"><div class="reply"><b>Maria</b>I am leaving in ten minutes...</div>Just the small notebook from the kitchen table, please.<div class="reaction">❤ 2 · M</div><div class="meta">16:09 <span class="ticks">✓✓</span></div></article>
+        <article class="bubble in short">Got it.<div class="meta">16:10</div></article>
+        <article class="bubble out wide"><div class="voice"><div class="play">▶</div><div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><span>0:14</span></div><div class="meta">16:11 <span class="ticks">✓✓</span></div></article>
+      </section>
+      <footer class="composer"><div class="input"><span>☺</span><span>Message</span></div><div class="send">➤</div></footer>
+    </section>
+  </main>
+</body>
+</html>

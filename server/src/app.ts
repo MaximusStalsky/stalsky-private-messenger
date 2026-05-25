@@ -348,7 +348,7 @@ export function buildApp(options: { db?: Db } = {}) {
   fs.mkdirSync(voicesDir, { recursive: true });
 
   app.decorate('db', db);
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     if (error instanceof ZodError) {
       const first = error.issues[0];
       return reply.code(400).send({
@@ -356,6 +356,12 @@ export function buildApp(options: { db?: Db } = {}) {
         message: first?.message ?? 'Invalid input'
       });
     }
+    console.error('request_failed', {
+      method: request.method,
+      url: request.url,
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    });
     return reply.code(500).send({ error: 'internal_server_error' });
   });
   app.register(cors, { origin: true, credentials: true });
