@@ -19,14 +19,25 @@ export type MessageView = {
   chatId: string;
   senderId: string;
   senderName: string;
-  type: 'text' | 'voice';
+  type: 'text' | 'voice' | 'photo' | 'file' | 'document';
   text: string;
   mediaUrl: string | null;
   durationMs: number | null;
+  filename: string | null;
+  mimeType: string | null;
+  sizeBytes: number | null;
+  thumbnailUrl: string | null;
+  linkPreview: {
+    url: string;
+    title: string | null;
+    description: string | null;
+    imageUrl: string | null;
+    domain: string;
+  } | null;
   replyToMessageId: string | null;
   replyToText: string | null;
   replyToSenderName: string | null;
-  replyToType: 'text' | 'voice' | null;
+  replyToType: 'text' | 'voice' | 'photo' | 'file' | 'document' | null;
   deletedAt: string | null;
   editedAt: string | null;
   pinned: 0 | 1 | boolean;

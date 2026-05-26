@@ -63,6 +63,22 @@ export function migrate(db: Db) {
       chat_id TEXT NOT NULL,
       sender_id TEXT NOT NULL,
       text TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'text',
+      media_url TEXT,
+      duration_ms INTEGER,
+      filename TEXT,
+      mime_type TEXT,
+      size_bytes INTEGER,
+      thumbnail_url TEXT,
+      preview_url TEXT,
+      preview_title TEXT,
+      preview_description TEXT,
+      preview_image_url TEXT,
+      preview_domain TEXT,
+      deleted_at TEXT,
+      edited_at TEXT,
+      auto_delete_at TEXT,
+      reply_to_message_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
       FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
@@ -115,6 +131,19 @@ export function migrate(db: Db) {
       FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL
     );
 
+    CREATE TABLE IF NOT EXISTS chat_user_settings (
+      chat_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      pinned_at TEXT,
+      archived_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chat_id, user_id),
+      FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_chat_user_settings_user ON chat_user_settings(user_id, archived_at, pinned_at);
+
     CREATE TABLE IF NOT EXISTS push_tokens (
       token TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -140,6 +169,15 @@ export function migrate(db: Db) {
   if (!hasMessageColumn('type')) db.exec("ALTER TABLE messages ADD COLUMN type TEXT NOT NULL DEFAULT 'text'");
   if (!hasMessageColumn('media_url')) db.exec('ALTER TABLE messages ADD COLUMN media_url TEXT');
   if (!hasMessageColumn('duration_ms')) db.exec('ALTER TABLE messages ADD COLUMN duration_ms INTEGER');
+  if (!hasMessageColumn('filename')) db.exec('ALTER TABLE messages ADD COLUMN filename TEXT');
+  if (!hasMessageColumn('mime_type')) db.exec('ALTER TABLE messages ADD COLUMN mime_type TEXT');
+  if (!hasMessageColumn('size_bytes')) db.exec('ALTER TABLE messages ADD COLUMN size_bytes INTEGER');
+  if (!hasMessageColumn('thumbnail_url')) db.exec('ALTER TABLE messages ADD COLUMN thumbnail_url TEXT');
+  if (!hasMessageColumn('preview_url')) db.exec('ALTER TABLE messages ADD COLUMN preview_url TEXT');
+  if (!hasMessageColumn('preview_title')) db.exec('ALTER TABLE messages ADD COLUMN preview_title TEXT');
+  if (!hasMessageColumn('preview_description')) db.exec('ALTER TABLE messages ADD COLUMN preview_description TEXT');
+  if (!hasMessageColumn('preview_image_url')) db.exec('ALTER TABLE messages ADD COLUMN preview_image_url TEXT');
+  if (!hasMessageColumn('preview_domain')) db.exec('ALTER TABLE messages ADD COLUMN preview_domain TEXT');
   if (!hasMessageColumn('deleted_at')) db.exec('ALTER TABLE messages ADD COLUMN deleted_at TEXT');
   if (!hasMessageColumn('edited_at')) db.exec('ALTER TABLE messages ADD COLUMN edited_at TEXT');
   if (!hasMessageColumn('auto_delete_at')) db.exec('ALTER TABLE messages ADD COLUMN auto_delete_at TEXT');

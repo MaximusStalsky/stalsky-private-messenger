@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import { buildApp } from '../src/app.js';
 import { migrate, type Db } from '../src/db.js';
+import { fallbackLinkPreview } from '../src/linkPreview.js';
 import { pushConfigured } from '../src/push.js';
 
 let db: Db;
@@ -50,6 +51,10 @@ async function authPost(token: string, url: string, payload: any) {
 
 async function authPatch(token: string, url: string, payload: any) {
   return app.inject({ method: 'PATCH', url, headers: { authorization: `Bearer ${token}` }, payload });
+}
+
+async function authPut(token: string, url: string, payload?: any) {
+  return app.inject({ method: 'PUT', url, headers: { authorization: `Bearer ${token}` }, payload });
 }
 
 async function authDelete(token: string, url: string, payload?: any) {
@@ -346,11 +351,95 @@ describe('contacts, chats, and messages', () => {
     expect(message.type).toBe('voice');
     expect(message.text).toBe('');
     expect(message.durationMs).toBe(1234);
+    expect(message.mimeType).toBe('audio/webm');
+    expect(message.sizeBytes).toBe(bytes.length);
     expect(message.mediaUrl).toMatch(/^\/uploads\/voices\/msg_.*\.webm$/);
     expect(fs.existsSync(path.join(uploadsDir, 'voices', path.basename(message.mediaUrl)))).toBe(true);
     const downloaded = await app.inject({ method: 'GET', url: message.mediaUrl });
     expect(downloaded.statusCode).toBe(200);
     expect(Buffer.compare(downloaded.rawPayload, bytes)).toBe(0);
+  });
+
+  it('uploads attachments in direct chats with media metadata', async () => {
+    const max = await register('max');
+    const anna = await register('anna');
+    await authPost(max.token, '/api/contacts', { username: 'anna' });
+    const chatId = (await authGet(max.token, '/api/chats')).json().chats[0].id;
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(32, 5), Buffer.from([0xff, 0xd9])]);
+
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/chats/${encodeURIComponent(chatId)}/attachments?filename=family.jpg`,
+      headers: { authorization: `Bearer ${max.token}`, 'content-type': 'image/jpeg' },
+      payload: bytes
+    });
+
+    expect(uploaded.statusCode).toBe(201);
+    const message = uploaded.json().message;
+    expect(message.type).toBe('photo');
+    expect(message.text).toBe('');
+    expect(message.filename).toBe('family.jpg');
+    expect(message.mimeType).toBe('image/jpeg');
+    expect(message.sizeBytes).toBe(bytes.length);
+    expect(message.mediaUrl).toMatch(/^\/uploads\/attachments\/msg_.*\.jpg$/);
+    expect(fs.existsSync(path.join(uploadsDir, 'attachments', path.basename(message.mediaUrl)))).toBe(true);
+
+    const messages = await authGet(anna.token, `/api/chats/${encodeURIComponent(chatId)}/messages`);
+    expect(messages.json().messages[0].id).toBe(message.id);
+    expect(messages.json().messages[0].mimeType).toBe('image/jpeg');
+  });
+
+  it('pins and archives chats per current user', async () => {
+    const max = await register('max');
+    const anna = await register('anna');
+    await authPost(max.token, '/api/contacts', { username: 'anna' });
+    const chatId = (await authGet(max.token, '/api/chats')).json().chats[0].id;
+
+    const settings = await authPatch(max.token, `/api/chats/${encodeURIComponent(chatId)}/user-settings`, { pinned: true, archived: true });
+    expect(settings.statusCode).toBe(200);
+    expect(settings.json().settings.pinned).toBe(true);
+    expect(settings.json().settings.archived).toBe(true);
+
+    const maxChats = await authGet(max.token, '/api/chats');
+    expect(maxChats.json().chats[0].pinned).toBe(true);
+    expect(maxChats.json().chats[0].archived).toBe(true);
+
+    const annaChats = await authGet(anna.token, '/api/chats');
+    expect(annaChats.json().chats[0].pinned).toBe(false);
+    expect(annaChats.json().chats[0].archived).toBe(false);
+
+    const unpinned = await authDelete(max.token, `/api/chats/${encodeURIComponent(chatId)}/pin`);
+    expect(unpinned.statusCode).toBe(200);
+    expect(unpinned.json().settings.pinned).toBe(false);
+
+    const archived = await authPut(max.token, `/api/chats/${encodeURIComponent(chatId)}/archive`);
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json().settings.archived).toBe(true);
+  });
+
+  it('returns domain-only link previews when richer parsing is unavailable', async () => {
+    expect(fallbackLinkPreview('https://example.com/path?x=1')).toEqual({
+      url: 'https://example.com/path?x=1',
+      title: null,
+      description: null,
+      imageUrl: null,
+      domain: 'example.com'
+    });
+
+    const max = await register('max');
+    const anna = await register('anna');
+    await authPost(max.token, '/api/contacts', { username: 'anna' });
+    const chatId = (await authGet(max.token, '/api/chats')).json().chats[0].id;
+
+    const sent = await authPost(max.token, `/api/chats/${encodeURIComponent(chatId)}/messages`, { text: 'Check http://127.0.0.1/private' });
+    expect(sent.statusCode).toBe(201);
+    expect(sent.json().message.linkPreview).toEqual({
+      url: 'http://127.0.0.1/private',
+      title: null,
+      description: null,
+      imageUrl: null,
+      domain: '127.0.0.1'
+    });
   });
 
   it('broadcasts websocket events for updates, deletes, reactions, pins, and settings', async () => {
@@ -466,6 +555,61 @@ describe('contacts, chats, and messages', () => {
     expect(invite.chatId).toBe(chatId);
     expect(invite.callId).toBe('call_test');
     expect(invite.from.username).toBe('max');
+    expect(strangerReceived).toBe(false);
+
+    annaSocket.close();
+    strangerSocket.close();
+    maxSocket.close();
+  }, 10000);
+
+  it('routes typing, recording, and uploading indicators only to the other direct chat member', async () => {
+    const max = await register('max');
+    const anna = await register('anna');
+    const stranger = await register('stranger');
+    await authPost(max.token, '/api/contacts', { username: 'anna' });
+    const chatId = (await authGet(max.token, '/api/chats')).json().chats[0].id;
+
+    const address = await app.listen({ port: 0, host: '127.0.0.1' });
+    const annaSocket = new WebSocket(address.replace('http://', 'ws://') + `/ws?token=${encodeURIComponent(anna.token)}`);
+    const strangerSocket = new WebSocket(address.replace('http://', 'ws://') + `/ws?token=${encodeURIComponent(stranger.token)}`);
+    const maxSocket = new WebSocket(address.replace('http://', 'ws://') + `/ws?token=${encodeURIComponent(max.token)}`);
+
+    await Promise.all([annaSocket, strangerSocket, maxSocket].map((socket) => new Promise<void>((resolve, reject) => {
+      socket.once('open', () => resolve());
+      socket.once('error', reject);
+    })));
+
+    const expected = new Set(['typing.start', 'recording.start', 'uploading.stop']);
+    const received = new Set<string>();
+    let strangerReceived = false;
+
+    strangerSocket.on('message', (data: Buffer) => {
+      const event = JSON.parse(data.toString());
+      if (expected.has(event.type)) strangerReceived = true;
+    });
+
+    const indicatorPromise = new Promise<Set<string>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('indicator timeout')), 3000);
+      annaSocket.on('message', (data: Buffer) => {
+        const event = JSON.parse(data.toString());
+        if (expected.has(event.type)) {
+          received.add(event.type);
+          expect(event.chatId).toBe(chatId);
+          expect(event.from.username).toBe('max');
+        }
+        if ([...expected].every((type) => received.has(type))) {
+          clearTimeout(timer);
+          resolve(received);
+        }
+      });
+    });
+
+    maxSocket.send(JSON.stringify({ type: 'typing.start', chatId }));
+    maxSocket.send(JSON.stringify({ type: 'recording.start', chatId }));
+    maxSocket.send(JSON.stringify({ type: 'uploading.stop', chatId }));
+
+    const indicators = await indicatorPromise;
+    expect([...expected].every((type) => indicators.has(type))).toBe(true);
     expect(strangerReceived).toBe(false);
 
     annaSocket.close();

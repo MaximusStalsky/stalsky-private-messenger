@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'package:file_picker/file_picker.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
@@ -12,9 +13,11 @@ import 'package:http/http.dart' as http;
 import 'package:image_cropper/image_cropper.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 Future<void> main() async {
@@ -43,6 +46,17 @@ Future<bool> initFirebaseIfPossible() async {
 enum AppLanguage { en, ru }
 
 enum AppThemeStyle { coffeeWood, bluePremium }
+
+enum AttachmentKind { photo, file, document }
+
+enum MessageDeliveryState { sent, sending, failed }
+
+enum ChatActivityKind { typing, recording, uploading }
+
+enum ChatListFilter { active, unread, archived }
+
+// TODO(0.6+): saved/starred messages, chat lock, advanced voice UX,
+// notification settings, and location sharing.
 
 extension AppThemeStyleLabel on AppThemeStyle {
   String get storageKey {
@@ -784,8 +798,116 @@ String peerStatus(ChatSummary chat) {
 
 String lastMessagePreview(ChatSummary chat) {
   final text = chat.lastText?.trim();
+  if (chat.draftText?.trim().isNotEmpty == true) {
+    return 'Draft: ${chat.draftText!.trim()}';
+  }
   if (text == null || text.isEmpty) return 'Voice message';
   return text;
+}
+
+String activityLabel(ChatActivityKind activity) {
+  switch (activity) {
+    case ChatActivityKind.typing:
+      return 'typing...';
+    case ChatActivityKind.recording:
+      return 'recording...';
+    case ChatActivityKind.uploading:
+      return 'uploading...';
+  }
+}
+
+String attachmentKindValue(AttachmentKind kind) {
+  switch (kind) {
+    case AttachmentKind.photo:
+      return 'photo';
+    case AttachmentKind.file:
+      return 'file';
+    case AttachmentKind.document:
+      return 'document';
+  }
+}
+
+AttachmentKind attachmentKindFromString(String? value) {
+  switch (value) {
+    case 'image':
+    case 'photo':
+      return AttachmentKind.photo;
+    case 'document':
+      return AttachmentKind.document;
+    default:
+      return AttachmentKind.file;
+  }
+}
+
+AttachmentKind attachmentKindFor(String fileName, String? mimeType) {
+  final lowerName = fileName.toLowerCase();
+  final lowerMime = mimeType?.toLowerCase() ?? '';
+  if (lowerMime.startsWith('image/') ||
+      lowerName.endsWith('.jpg') ||
+      lowerName.endsWith('.jpeg') ||
+      lowerName.endsWith('.png') ||
+      lowerName.endsWith('.gif') ||
+      lowerName.endsWith('.webp')) {
+    return AttachmentKind.photo;
+  }
+  if (lowerMime.contains('pdf') ||
+      lowerMime.contains('document') ||
+      lowerMime.contains('spreadsheet') ||
+      lowerMime.contains('presentation') ||
+      lowerName.endsWith('.pdf') ||
+      lowerName.endsWith('.doc') ||
+      lowerName.endsWith('.docx') ||
+      lowerName.endsWith('.xls') ||
+      lowerName.endsWith('.xlsx') ||
+      lowerName.endsWith('.ppt') ||
+      lowerName.endsWith('.pptx') ||
+      lowerName.endsWith('.txt')) {
+    return AttachmentKind.document;
+  }
+  return AttachmentKind.file;
+}
+
+IconData attachmentIcon(AttachmentKind kind) {
+  switch (kind) {
+    case AttachmentKind.photo:
+      return Icons.image_outlined;
+    case AttachmentKind.document:
+      return Icons.description_outlined;
+    case AttachmentKind.file:
+      return Icons.insert_drive_file_outlined;
+  }
+}
+
+String formatBytes(int? bytes) {
+  if (bytes == null || bytes <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  var value = bytes.toDouble();
+  var index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index++;
+  }
+  final decimals = value >= 10 || index == 0 ? 0 : 1;
+  return '${value.toStringAsFixed(decimals)} ${units[index]}';
+}
+
+String domainForUrl(String? value) {
+  final uri = Uri.tryParse(value ?? '');
+  if (uri == null || uri.host.isEmpty) return '';
+  return uri.host.replaceFirst(RegExp(r'^www\.'), '');
+}
+
+String messageContentLabel(ChatMessage message) {
+  if (message.voiceUrl != null || message.localVoicePath != null) {
+    return 'Voice message';
+  }
+  final attachment = message.attachment;
+  if (attachment != null) {
+    return attachment.kind == AttachmentKind.photo
+        ? 'Photo'
+        : attachment.fileName;
+  }
+  return message.text;
 }
 
 class ApiClient {
@@ -954,6 +1076,49 @@ class ApiClient {
 
   Future<void> markChatRead(String chatId) async {
     await postJson('/api/chats/${Uri.encodeComponent(chatId)}/read', {});
+  }
+
+  Future<Map<String, dynamic>> sendMessage(
+    String chatId,
+    String text, {
+    String? replyToMessageId,
+  }) {
+    final body = <String, dynamic>{'text': text};
+    if (replyToMessageId != null) body['replyToMessageId'] = replyToMessageId;
+    return postJson('/api/chats/${Uri.encodeComponent(chatId)}/messages', body);
+  }
+
+  Future<Map<String, dynamic>> sendAttachmentMessage(
+    String chatId,
+    Uint8List bytes, {
+    required String fileName,
+    required AttachmentKind kind,
+    String? mimeType,
+    String? text,
+    String? replyToMessageId,
+  }) {
+    final contentType = mimeType ?? switch (kind) {
+      AttachmentKind.photo => 'image/jpeg',
+      AttachmentKind.document => 'application/pdf',
+      AttachmentKind.file => 'application/octet-stream',
+    };
+    return postBytes(
+      '/api/chats/${Uri.encodeComponent(chatId)}/attachments?filename=${Uri.encodeQueryComponent(fileName)}',
+      bytes,
+      contentType,
+    );
+  }
+
+  Future<void> setChatPinned(String chatId, bool pinned) async {
+    await patchJson('/api/chats/${Uri.encodeComponent(chatId)}/user-settings', {
+      'pinned': pinned,
+    });
+  }
+
+  Future<void> setChatArchived(String chatId, bool archived) async {
+    await patchJson('/api/chats/${Uri.encodeComponent(chatId)}/user-settings', {
+      'archived': archived,
+    });
   }
 
   Future<Map<String, dynamic>> sendVoiceMessage(
@@ -1283,6 +1448,10 @@ class ChatSummary {
     this.peerLastSeenAt,
     this.lastText,
     this.lastAt,
+    this.unreadCount = 0,
+    this.pinned = false,
+    this.archived = false,
+    this.draftText,
   });
   final String id;
   final String peerId;
@@ -1293,6 +1462,10 @@ class ChatSummary {
   final String? peerLastSeenAt;
   final String? lastText;
   final String? lastAt;
+  final int unreadCount;
+  final bool pinned;
+  final bool archived;
+  final String? draftText;
 
   factory ChatSummary.fromJson(Map<String, dynamic> json) => ChatSummary(
     id: json['id'] as String,
@@ -1304,20 +1477,134 @@ class ChatSummary {
     peerLastSeenAt: json['peerLastSeenAt'] as String?,
     lastText: json['lastText'] as String?,
     lastAt: json['lastAt'] as String?,
+    unreadCount: (json['unreadCount'] as num? ?? json['unread'] as num? ?? 0)
+        .toInt(),
+    pinned: json['pinned'] == true || json['isPinned'] == true,
+    archived: json['archived'] == true || json['isArchived'] == true,
   );
 
-  ChatSummary copyWith({bool? peerOnline, String? peerLastSeenAt}) =>
-      ChatSummary(
-        id: id,
-        peerId: peerId,
-        peerUsername: peerUsername,
-        peerDisplayName: peerDisplayName,
-        peerAvatarUrl: peerAvatarUrl,
-        peerOnline: peerOnline ?? this.peerOnline,
-        peerLastSeenAt: peerLastSeenAt ?? this.peerLastSeenAt,
-        lastText: lastText,
-        lastAt: lastAt,
-      );
+  ChatSummary copyWith({
+    bool? peerOnline,
+    String? peerLastSeenAt,
+    int? unreadCount,
+    bool? pinned,
+    bool? archived,
+    String? draftText,
+  }) => ChatSummary(
+    id: id,
+    peerId: peerId,
+    peerUsername: peerUsername,
+    peerDisplayName: peerDisplayName,
+    peerAvatarUrl: peerAvatarUrl,
+    peerOnline: peerOnline ?? this.peerOnline,
+    peerLastSeenAt: peerLastSeenAt ?? this.peerLastSeenAt,
+    lastText: lastText,
+    lastAt: lastAt,
+    unreadCount: unreadCount ?? this.unreadCount,
+    pinned: pinned ?? this.pinned,
+    archived: archived ?? this.archived,
+    draftText: draftText ?? this.draftText,
+  );
+}
+
+class MessageAttachment {
+  const MessageAttachment({
+    required this.kind,
+    required this.fileName,
+    this.id,
+    this.url,
+    this.thumbnailUrl,
+    this.mimeType,
+    this.sizeBytes,
+    this.localPath,
+    this.localBytes,
+  });
+
+  final String? id;
+  final AttachmentKind kind;
+  final String fileName;
+  final String? url;
+  final String? thumbnailUrl;
+  final String? mimeType;
+  final int? sizeBytes;
+  final String? localPath;
+  final Uint8List? localBytes;
+
+  factory MessageAttachment.fromJson(Map<String, dynamic> json) {
+    final fileName =
+        json['fileName'] as String? ??
+        json['name'] as String? ??
+        json['filename'] as String? ??
+        'Attachment';
+    final mimeType =
+        json['mimeType'] as String? ?? json['contentType'] as String?;
+    return MessageAttachment(
+      id: json['id']?.toString(),
+      kind: attachmentKindFromString(
+        json['kind'] as String? ??
+            json['type'] as String? ??
+            json['attachmentType'] as String?,
+      ),
+      fileName: fileName,
+      url:
+          json['url'] as String? ??
+          json['mediaUrl'] as String? ??
+          json['fileUrl'] as String?,
+      thumbnailUrl:
+          json['thumbnailUrl'] as String? ?? json['thumbUrl'] as String?,
+      mimeType: mimeType,
+      sizeBytes: (json['sizeBytes'] as num? ?? json['size'] as num?)?.toInt(),
+    );
+  }
+
+  MessageAttachment copyWith({
+    String? id,
+    AttachmentKind? kind,
+    String? fileName,
+    String? url,
+    String? thumbnailUrl,
+    String? mimeType,
+    int? sizeBytes,
+    String? localPath,
+    Uint8List? localBytes,
+  }) => MessageAttachment(
+    id: id ?? this.id,
+    kind: kind ?? this.kind,
+    fileName: fileName ?? this.fileName,
+    url: url ?? this.url,
+    thumbnailUrl: thumbnailUrl ?? this.thumbnailUrl,
+    mimeType: mimeType ?? this.mimeType,
+    sizeBytes: sizeBytes ?? this.sizeBytes,
+    localPath: localPath ?? this.localPath,
+    localBytes: localBytes ?? this.localBytes,
+  );
+}
+
+class LinkPreview {
+  const LinkPreview({
+    this.url,
+    this.domain,
+    this.title,
+    this.description,
+    this.thumbnailUrl,
+  });
+
+  final String? url;
+  final String? domain;
+  final String? title;
+  final String? description;
+  final String? thumbnailUrl;
+
+  factory LinkPreview.fromJson(Map<String, dynamic> json) => LinkPreview(
+    url: json['url'] as String? ?? json['href'] as String?,
+    domain: json['domain'] as String? ?? json['siteName'] as String?,
+    title: json['title'] as String?,
+    description: json['description'] as String?,
+    thumbnailUrl:
+        json['thumbnailUrl'] as String? ??
+        json['imageUrl'] as String? ??
+        json['image'] as String?,
+  );
 }
 
 class ChatMessage {
@@ -1337,6 +1624,9 @@ class ChatMessage {
     this.voiceDurationSeconds,
     this.localVoicePath,
     this.uploading = false,
+    this.deliveryState = MessageDeliveryState.sent,
+    this.attachment,
+    this.linkPreview,
     this.replyToMessageId,
     this.replyToText,
     this.replyToSenderName,
@@ -1357,45 +1647,86 @@ class ChatMessage {
   final int? voiceDurationSeconds;
   final String? localVoicePath;
   final bool uploading;
+  final MessageDeliveryState deliveryState;
+  final MessageAttachment? attachment;
+  final LinkPreview? linkPreview;
   final String? replyToMessageId;
   final String? replyToText;
   final String? replyToSenderName;
   final String? replyToType;
 
-  factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
-    id: json['id'] as String,
-    chatId: json['chatId'] as String,
-    senderId: json['senderId'] as String,
-    senderName: json['senderName'] as String,
-    text: json['text'] as String? ?? '',
-    createdAt: json['createdAt'] as String,
-    editedAt: json['editedAt'] as String?,
-    pinned:
-        json['pinned'] == true ||
-        json['pinned'] == 1 ||
-        json['isPinned'] == true,
-    readByPeer:
-        json['readByPeer'] == true ||
-        json['readByPeer'] == 1 ||
-        json['isRead'] == true,
-    reactions: _parseReactions(json['reactions']),
-    reactionUsers: _parseReactionUsers(json['reactions']),
-    voiceUrl:
-        json['voiceUrl'] as String? ??
-        json['audioUrl'] as String? ??
-        json['mediaUrl'] as String?,
-    voiceDurationSeconds:
-        (json['voiceDurationSeconds'] as num? ??
-                json['durationSeconds'] as num? ??
-                ((json['durationMs'] as num?) == null
-                    ? null
-                    : ((json['durationMs'] as num) / 1000).ceil()))
-            ?.toInt(),
-    replyToMessageId: json['replyToMessageId'] as String?,
-    replyToText: json['replyToText'] as String?,
-    replyToSenderName: json['replyToSenderName'] as String?,
-    replyToType: json['replyToType'] as String?,
-  );
+  factory ChatMessage.fromJson(Map<String, dynamic> json) {
+    final rawAttachment = json['attachment'];
+    final rawAttachments = json['attachments'];
+    MessageAttachment? attachment;
+    if (rawAttachment is Map<String, dynamic>) {
+      attachment = MessageAttachment.fromJson(rawAttachment);
+    } else if (rawAttachments is List && rawAttachments.isNotEmpty) {
+      final first = rawAttachments.first;
+      if (first is Map<String, dynamic>) {
+        attachment = MessageAttachment.fromJson(first);
+      }
+    } else if (json['fileUrl'] != null || json['attachmentUrl'] != null) {
+      final fileUri = Uri.tryParse(
+        json['fileUrl']?.toString() ?? json['attachmentUrl']?.toString() ?? '',
+      );
+      final fileName =
+          json['fileName'] as String? ??
+          (fileUri == null || fileUri.pathSegments.isEmpty
+              ? null
+              : fileUri.pathSegments.last) ??
+          'Attachment';
+      final mimeType = json['mimeType'] as String?;
+      attachment = MessageAttachment(
+        kind: attachmentKindFor(fileName, mimeType),
+        fileName: fileName,
+        url: json['fileUrl'] as String? ?? json['attachmentUrl'] as String?,
+        thumbnailUrl: json['thumbnailUrl'] as String?,
+        mimeType: mimeType,
+        sizeBytes: (json['sizeBytes'] as num? ?? json['size'] as num?)?.toInt(),
+      );
+    }
+
+    final rawPreview = json['linkPreview'] ?? json['preview'];
+    return ChatMessage(
+      id: json['id'] as String,
+      chatId: json['chatId'] as String,
+      senderId: json['senderId'] as String,
+      senderName: json['senderName'] as String,
+      text: json['text'] as String? ?? '',
+      createdAt: json['createdAt'] as String,
+      editedAt: json['editedAt'] as String?,
+      pinned:
+          json['pinned'] == true ||
+          json['pinned'] == 1 ||
+          json['isPinned'] == true,
+      readByPeer:
+          json['readByPeer'] == true ||
+          json['readByPeer'] == 1 ||
+          json['isRead'] == true,
+      reactions: _parseReactions(json['reactions']),
+      reactionUsers: _parseReactionUsers(json['reactions']),
+      voiceUrl:
+          json['voiceUrl'] as String? ??
+          json['audioUrl'] as String? ??
+          ((attachment == null) ? json['mediaUrl'] as String? : null),
+      voiceDurationSeconds:
+          (json['voiceDurationSeconds'] as num? ??
+                  json['durationSeconds'] as num? ??
+                  ((json['durationMs'] as num?) == null
+                      ? null
+                      : ((json['durationMs'] as num) / 1000).ceil()))
+              ?.toInt(),
+      attachment: attachment,
+      linkPreview: rawPreview is Map<String, dynamic>
+          ? LinkPreview.fromJson(rawPreview)
+          : null,
+      replyToMessageId: json['replyToMessageId'] as String?,
+      replyToText: json['replyToText'] as String?,
+      replyToSenderName: json['replyToSenderName'] as String?,
+      replyToType: json['replyToType'] as String?,
+    );
+  }
 
   ChatMessage copyWith({
     String? text,
@@ -1408,6 +1739,9 @@ class ChatMessage {
     int? voiceDurationSeconds,
     String? localVoicePath,
     bool? uploading,
+    MessageDeliveryState? deliveryState,
+    MessageAttachment? attachment,
+    LinkPreview? linkPreview,
     String? replyToMessageId,
     String? replyToText,
     String? replyToSenderName,
@@ -1428,6 +1762,9 @@ class ChatMessage {
     voiceDurationSeconds: voiceDurationSeconds ?? this.voiceDurationSeconds,
     localVoicePath: localVoicePath ?? this.localVoicePath,
     uploading: uploading ?? this.uploading,
+    deliveryState: deliveryState ?? this.deliveryState,
+    attachment: attachment ?? this.attachment,
+    linkPreview: linkPreview ?? this.linkPreview,
     replyToMessageId: replyToMessageId ?? this.replyToMessageId,
     replyToText: replyToText ?? this.replyToText,
     replyToSenderName: replyToSenderName ?? this.replyToSenderName,
@@ -1439,6 +1776,39 @@ class MessageReaction {
   const MessageReaction({required this.count, this.userIds = const []});
   final int count;
   final List<String> userIds;
+}
+
+class PeerActivity {
+  const PeerActivity({required this.kind, required this.expiresAt});
+  final ChatActivityKind kind;
+  final DateTime expiresAt;
+
+  bool get active => expiresAt.isAfter(DateTime.now());
+}
+
+class PendingOutgoing {
+  const PendingOutgoing({
+    required this.localId,
+    required this.chatId,
+    required this.text,
+    this.replyToMessageId,
+    this.attachment,
+    this.bytes,
+    this.voicePath,
+    this.voiceDurationSeconds = 0,
+  });
+
+  final String localId;
+  final String chatId;
+  final String text;
+  final String? replyToMessageId;
+  final MessageAttachment? attachment;
+  final Uint8List? bytes;
+  final String? voicePath;
+  final int voiceDurationSeconds;
+
+  bool get isVoice => voicePath != null;
+  bool get isAttachment => attachment != null && bytes != null;
 }
 
 Map<String, int> _parseReactions(dynamic value) {
@@ -1553,12 +1923,16 @@ class _MessengerHomeState extends State<MessengerHome>
   final chats = <ChatSummary>[];
   final messages = <String, List<ChatMessage>>{};
   final pendingVoicePaths = <String, List<String>>{};
+  final pendingOutgoing = <String, PendingOutgoing>{};
+  final peerActivities = <String, PeerActivity>{};
+  final chatDrafts = <String, String>{};
   ChatSummary? selectedChat;
   WebSocketChannel? channel;
   StreamSubscription? socketSub;
   StreamSubscription<String>? notificationTapSub;
   StreamSubscription<CallNotificationAction>? callNotificationActionSub;
   Timer? incomingCallTimeoutTimer;
+  Timer? activityCleanupTimer;
   String? pendingNotificationChatId;
   AppLifecycleState lifecycleState = AppLifecycleState.resumed;
   VoiceCallSession? voiceCall;
@@ -1581,6 +1955,7 @@ class _MessengerHomeState extends State<MessengerHome>
     notificationTapSub?.cancel();
     callNotificationActionSub?.cancel();
     incomingCallTimeoutTimer?.cancel();
+    activityCleanupTimer?.cancel();
     channel?.sink.close();
     for (final track in localVoiceStream?.getTracks() ?? <MediaStreamTrack>[]) {
       track.stop();
@@ -1658,6 +2033,7 @@ class _MessengerHomeState extends State<MessengerHome>
   void connectSocket() {
     socketSub?.cancel();
     channel?.sink.close();
+    activityCleanupTimer?.cancel();
     if (token == null) return;
     final uri = Uri.parse(
       '${wsBaseFor(api.baseUrl)}/ws?token=${Uri.encodeComponent(token!)}',
@@ -1752,11 +2128,25 @@ class _MessengerHomeState extends State<MessengerHome>
           final lastSeenAt = user['lastSeenAt'] as String?;
           if (userId != null) updatePeerPresence(userId, online, lastSeenAt);
         }
+      } else if (data['type'] == 'chat.activity' ||
+          data['type'] == 'typing' ||
+          data['type'] == 'recording' ||
+          data['type'] == 'uploading') {
+        handleChatActivity(data);
       } else if (data['type'] is String &&
           (data['type'] as String).startsWith('call.')) {
         unawaited(handleCallSignal(data));
       }
     }, onError: (_) {});
+    activityCleanupTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!mounted) return;
+      final now = DateTime.now();
+      final before = peerActivities.length;
+      peerActivities.removeWhere(
+        (_, activity) => !activity.expiresAt.isAfter(now),
+      );
+      if (before != peerActivities.length) setState(() {});
+    });
   }
 
   void replaceLocalMessage(ChatMessage message) {
@@ -1771,6 +2161,18 @@ class _MessengerHomeState extends State<MessengerHome>
     });
   }
 
+  void replaceLocalMessageById(String localId, ChatMessage message) {
+    setState(() {
+      final list = messages.putIfAbsent(message.chatId, () => []);
+      final index = list.indexWhere((item) => item.id == localId);
+      if (index == -1) {
+        if (!list.any((item) => item.id == message.id)) list.add(message);
+      } else {
+        list[index] = message;
+      }
+    });
+  }
+
   void mergeIncomingMessage(ChatMessage message) {
     setState(() {
       final list = messages.putIfAbsent(message.chatId, () => []);
@@ -1779,11 +2181,44 @@ class _MessengerHomeState extends State<MessengerHome>
         pendingVoicePaths[message.chatId]?.remove(
           list[existingIndex].localVoicePath,
         );
+        pendingOutgoing.remove(list[existingIndex].id);
         list[existingIndex] = message.copyWith(
           localVoicePath: list[existingIndex].localVoicePath,
+          attachment: message.attachment?.copyWith(
+            localPath: list[existingIndex].attachment?.localPath,
+            localBytes: list[existingIndex].attachment?.localBytes,
+          ),
           uploading: false,
+          deliveryState: MessageDeliveryState.sent,
         );
         return;
+      }
+      if (message.senderId == currentUser?.id) {
+        final localIndex = list.indexWhere(
+          (item) =>
+              item.id.startsWith('local_') &&
+              item.senderId == message.senderId &&
+              item.deliveryState != MessageDeliveryState.failed &&
+              ((message.attachment != null && item.attachment != null) ||
+                  (message.voiceUrl != null && item.localVoicePath != null) ||
+                  (message.text.trim().isNotEmpty &&
+                      item.text.trim() == message.text.trim())),
+        );
+        if (localIndex != -1) {
+          final local = list[localIndex];
+          pendingOutgoing.remove(local.id);
+          pendingVoicePaths[message.chatId]?.remove(local.localVoicePath);
+          list[localIndex] = message.copyWith(
+            localVoicePath: local.localVoicePath,
+            attachment: message.attachment?.copyWith(
+              localPath: local.attachment?.localPath,
+              localBytes: local.attachment?.localBytes,
+            ),
+            uploading: false,
+            deliveryState: MessageDeliveryState.sent,
+          );
+          return;
+        }
       }
       if (message.senderId == currentUser?.id && message.voiceUrl != null) {
         final localIndex = list.indexWhere(
@@ -1815,6 +2250,54 @@ class _MessengerHomeState extends State<MessengerHome>
 
   void sendSocketEvent(Map<String, dynamic> event) {
     channel?.sink.add(jsonEncode(event));
+  }
+
+  void sendChatActivity(
+    String chatId,
+    ChatActivityKind kind, {
+    required bool active,
+  }) {
+    sendSocketEvent({
+      'type': '${kind.name}.${active ? 'start' : 'stop'}',
+      'chatId': chatId,
+    });
+  }
+
+  void handleChatActivity(Map<String, dynamic> data) {
+    final chatId = data['chatId'] as String?;
+    if (chatId == null) return;
+    final from = data['from'];
+    final fromId = from is Map<String, dynamic> ? from['id'] as String? : null;
+    if (fromId != null && fromId == currentUser?.id) return;
+    final type = data['type'] as String?;
+    final raw =
+        data['activity'] as String? ??
+        (type?.contains('.') == true ? type!.split('.').first : type);
+    final kind = ChatActivityKind.values
+        .where((item) => item.name == raw)
+        .firstOrNull;
+    if (kind == null) return;
+    final active = type?.endsWith('.stop') == true ? false : data['active'] != false;
+    setState(() {
+      if (active) {
+        peerActivities[chatId] = PeerActivity(
+          kind: kind,
+          expiresAt: DateTime.now().add(const Duration(seconds: 5)),
+        );
+      } else {
+        peerActivities.remove(chatId);
+      }
+    });
+  }
+
+  void updateDraft(String chatId, String value) {
+    chatDrafts[chatId] = value;
+    final index = chats.indexWhere((chat) => chat.id == chatId);
+    if (index != -1) {
+      chats[index] = chats[index].copyWith(draftText: value);
+      if (selectedChat?.id == chatId) selectedChat = chats[index];
+    }
+    if (mounted) setState(() {});
   }
 
   void updatePeerPresence(String userId, bool online, String? lastSeenAt) {
@@ -2147,6 +2630,9 @@ class _MessengerHomeState extends State<MessengerHome>
       contacts.clear();
       chats.clear();
       messages.clear();
+      pendingOutgoing.clear();
+      peerActivities.clear();
+      chatDrafts.clear();
       selectedChat = null;
     });
   }
@@ -2197,12 +2683,19 @@ class _MessengerHomeState extends State<MessengerHome>
 
   Future<void> loadChats() async {
     final data = await api.getJson('/api/chats');
+    final previous = {for (final chat in chats) chat.id: chat};
     chats
       ..clear()
       ..addAll(
-        (data['chats'] as List).map(
-          (item) => ChatSummary.fromJson(item as Map<String, dynamic>),
-        ),
+        (data['chats'] as List).map((item) {
+          final chat = ChatSummary.fromJson(item as Map<String, dynamic>);
+          final old = previous[chat.id];
+          return chat.copyWith(
+            draftText: chatDrafts[chat.id],
+            pinned: old?.pinned == true ? true : chat.pinned,
+            archived: old?.archived == true ? true : chat.archived,
+          );
+        }),
       );
     if (selectedChat != null) {
       selectedChat = chats
@@ -2253,6 +2746,11 @@ class _MessengerHomeState extends State<MessengerHome>
             ? message
             : message.copyWith(readByPeer: true),
     ];
+    final index = chats.indexWhere((item) => item.id == chat.id);
+    if (index != -1) {
+      chats[index] = chats[index].copyWith(unreadCount: 0);
+      selectedChat = chats[index];
+    }
   }
 
   void closeSelectedChat() {
@@ -2276,22 +2774,221 @@ class _MessengerHomeState extends State<MessengerHome>
   Future<void> sendMessage(String text, {ChatMessage? replyTo}) async {
     final chat = selectedChat;
     if (chat == null || text.trim().isEmpty) return;
-    final data = await api.postJson(
-      '/api/chats/${Uri.encodeComponent(chat.id)}/messages',
-      {
-        'text': text.trim(),
-        if (replyTo != null) 'replyToMessageId': replyTo.id,
-      },
+    final value = text.trim();
+    final localId = 'local_${DateTime.now().microsecondsSinceEpoch}';
+    final localMessage = ChatMessage(
+      id: localId,
+      chatId: chat.id,
+      senderId: currentUser!.id,
+      senderName: currentUser!.displayName,
+      text: value,
+      createdAt: DateTime.now().toIso8601String(),
+      uploading: true,
+      deliveryState: MessageDeliveryState.sending,
+      replyToMessageId: replyTo?.id,
+      replyToText: replyTo?.text,
+      replyToSenderName: replyTo?.senderName,
+      replyToType: replyTo == null
+          ? null
+          : (replyTo.voiceUrl != null || replyTo.localVoicePath != null)
+          ? 'voice'
+          : replyTo.attachment != null
+          ? 'attachment'
+          : 'text',
     );
-    final message = ChatMessage.fromJson(
-      data['message'] as Map<String, dynamic>,
+    messages.putIfAbsent(chat.id, () => []).add(localMessage);
+    pendingOutgoing[localId] = PendingOutgoing(
+      localId: localId,
+      chatId: chat.id,
+      text: value,
+      replyToMessageId: replyTo?.id,
     );
-    messages.putIfAbsent(chat.id, () => []);
-    if (!messages[chat.id]!.any((item) => item.id == message.id)) {
-      messages[chat.id]!.add(message);
-    }
-    await loadChats();
     if (mounted) setState(() {});
+    try {
+      final data = await api.sendMessage(
+        chat.id,
+        value,
+        replyToMessageId: replyTo?.id,
+      );
+      final message = ChatMessage.fromJson(
+        data['message'] as Map<String, dynamic>,
+      );
+      pendingOutgoing.remove(localId);
+      replaceLocalMessageById(
+        localId,
+        message.copyWith(
+          uploading: false,
+          deliveryState: MessageDeliveryState.sent,
+        ),
+      );
+      chatDrafts.remove(chat.id);
+      await loadChats();
+    } catch (_) {
+      replaceLocalMessageById(
+        localId,
+        localMessage.copyWith(
+          uploading: false,
+          deliveryState: MessageDeliveryState.failed,
+        ),
+      );
+    }
+  }
+
+  Future<void> sendAttachmentMessage(
+    MessageAttachment attachment,
+    Uint8List bytes, {
+    String text = '',
+    ChatMessage? replyTo,
+  }) async {
+    final chat = selectedChat;
+    if (chat == null) return;
+    final localId = 'local_${DateTime.now().microsecondsSinceEpoch}';
+    final localMessage = ChatMessage(
+      id: localId,
+      chatId: chat.id,
+      senderId: currentUser!.id,
+      senderName: currentUser!.displayName,
+      text: text.trim(),
+      createdAt: DateTime.now().toIso8601String(),
+      uploading: true,
+      deliveryState: MessageDeliveryState.sending,
+      attachment: attachment,
+      replyToMessageId: replyTo?.id,
+      replyToText: replyTo?.text,
+      replyToSenderName: replyTo?.senderName,
+      replyToType: replyTo == null
+          ? null
+          : (replyTo.voiceUrl != null || replyTo.localVoicePath != null)
+          ? 'voice'
+          : replyTo.attachment != null
+          ? 'attachment'
+          : 'text',
+    );
+    messages.putIfAbsent(chat.id, () => []).add(localMessage);
+    pendingOutgoing[localId] = PendingOutgoing(
+      localId: localId,
+      chatId: chat.id,
+      text: text.trim(),
+      replyToMessageId: replyTo?.id,
+      attachment: attachment,
+      bytes: bytes,
+    );
+    sendChatActivity(chat.id, ChatActivityKind.uploading, active: true);
+    if (mounted) setState(() {});
+    try {
+      final data = await api.sendAttachmentMessage(
+        chat.id,
+        bytes,
+        fileName: attachment.fileName,
+        kind: attachment.kind,
+        mimeType: attachment.mimeType,
+        text: text,
+        replyToMessageId: replyTo?.id,
+      );
+      final message = ChatMessage.fromJson(
+        data['message'] as Map<String, dynamic>,
+      );
+      pendingOutgoing.remove(localId);
+      replaceLocalMessageById(
+        localId,
+        message.copyWith(
+          attachment: message.attachment?.copyWith(
+            localPath: attachment.localPath,
+            localBytes: attachment.localBytes,
+          ),
+          uploading: false,
+          deliveryState: MessageDeliveryState.sent,
+        ),
+      );
+      await loadChats();
+    } catch (_) {
+      replaceLocalMessageById(
+        localId,
+        localMessage.copyWith(
+          uploading: false,
+          deliveryState: MessageDeliveryState.failed,
+        ),
+      );
+    } finally {
+      sendChatActivity(chat.id, ChatActivityKind.uploading, active: false);
+    }
+  }
+
+  Future<void> retryMessage(ChatMessage message) async {
+    final pending = pendingOutgoing[message.id];
+    if (pending == null) return;
+    replaceLocalMessageById(
+      message.id,
+      message.copyWith(
+        uploading: true,
+        deliveryState: MessageDeliveryState.sending,
+      ),
+    );
+    try {
+      Map<String, dynamic> data;
+      if (pending.isVoice) {
+        final bytes = await XFile(pending.voicePath!).readAsBytes();
+        data = await api.sendVoiceMessage(
+          pending.chatId,
+          bytes,
+          durationSeconds: pending.voiceDurationSeconds,
+        );
+      } else if (pending.isAttachment) {
+        sendChatActivity(
+          pending.chatId,
+          ChatActivityKind.uploading,
+          active: true,
+        );
+        data = await api.sendAttachmentMessage(
+          pending.chatId,
+          pending.bytes!,
+          fileName: pending.attachment!.fileName,
+          kind: pending.attachment!.kind,
+          mimeType: pending.attachment!.mimeType,
+          text: pending.text,
+          replyToMessageId: pending.replyToMessageId,
+        );
+      } else {
+        data = await api.sendMessage(
+          pending.chatId,
+          pending.text,
+          replyToMessageId: pending.replyToMessageId,
+        );
+      }
+      final sent = ChatMessage.fromJson(
+        data['message'] as Map<String, dynamic>,
+      );
+      pendingOutgoing.remove(message.id);
+      replaceLocalMessageById(
+        message.id,
+        sent.copyWith(
+          localVoicePath: message.localVoicePath,
+          attachment: sent.attachment?.copyWith(
+            localPath: message.attachment?.localPath,
+            localBytes: message.attachment?.localBytes,
+          ),
+          uploading: false,
+          deliveryState: MessageDeliveryState.sent,
+        ),
+      );
+      await loadChats();
+    } catch (_) {
+      replaceLocalMessageById(
+        message.id,
+        message.copyWith(
+          uploading: false,
+          deliveryState: MessageDeliveryState.failed,
+        ),
+      );
+    } finally {
+      if (pending.isAttachment) {
+        sendChatActivity(
+          pending.chatId,
+          ChatActivityKind.uploading,
+          active: false,
+        );
+      }
+    }
   }
 
   Future<void> editMessage(ChatMessage message, String text) async {
@@ -2383,6 +3080,54 @@ class _MessengerHomeState extends State<MessengerHome>
     }
   }
 
+  Future<void> setChatPinned(ChatSummary chat, bool pinned) async {
+    final index = chats.indexWhere((item) => item.id == chat.id);
+    if (index != -1) {
+      setState(() {
+        chats[index] = chats[index].copyWith(pinned: pinned);
+        if (selectedChat?.id == chat.id) selectedChat = chats[index];
+      });
+    }
+    try {
+      await api.setChatPinned(chat.id, pinned);
+      await loadChats();
+    } catch (exception) {
+      if (index != -1 && mounted) {
+        setState(() {
+          chats[index] = chats[index].copyWith(pinned: !pinned);
+          if (selectedChat?.id == chat.id) selectedChat = chats[index];
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not update chat: $exception')),
+        );
+      }
+    }
+  }
+
+  Future<void> setChatArchived(ChatSummary chat, bool archived) async {
+    final index = chats.indexWhere((item) => item.id == chat.id);
+    if (index != -1) {
+      setState(() {
+        chats[index] = chats[index].copyWith(archived: archived);
+        if (selectedChat?.id == chat.id) selectedChat = chats[index];
+      });
+    }
+    try {
+      await api.setChatArchived(chat.id, archived);
+      await loadChats();
+    } catch (exception) {
+      if (index != -1 && mounted) {
+        setState(() {
+          chats[index] = chats[index].copyWith(archived: !archived);
+          if (selectedChat?.id == chat.id) selectedChat = chats[index];
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not update chat: $exception')),
+        );
+      }
+    }
+  }
+
   Future<List<ChatMessage>> searchMessages(String query) async {
     final chat = selectedChat;
     if (chat == null || query.trim().isEmpty) return const [];
@@ -2409,10 +3154,19 @@ class _MessengerHomeState extends State<MessengerHome>
       voiceDurationSeconds: durationSeconds,
       localVoicePath: path,
       uploading: true,
+      deliveryState: MessageDeliveryState.sending,
     );
     messages.putIfAbsent(chat.id, () => []);
     messages[chat.id]!.add(localMessage);
     pendingVoicePaths.putIfAbsent(chat.id, () => []).add(path);
+    pendingOutgoing[localId] = PendingOutgoing(
+      localId: localId,
+      chatId: chat.id,
+      text: '',
+      voicePath: path,
+      voiceDurationSeconds: durationSeconds,
+    );
+    sendChatActivity(chat.id, ChatActivityKind.uploading, active: true);
     if (mounted) setState(() {});
     try {
       final bytes = await XFile(path).readAsBytes();
@@ -2421,13 +3175,26 @@ class _MessengerHomeState extends State<MessengerHome>
         bytes,
         durationSeconds: durationSeconds,
       );
-      final message = ChatMessage.fromJson(
-        data['message'] as Map<String, dynamic>,
-      ).copyWith(localVoicePath: path, uploading: false);
+      final message =
+          ChatMessage.fromJson(
+            data['message'] as Map<String, dynamic>,
+          ).copyWith(
+            localVoicePath: path,
+            uploading: false,
+            deliveryState: MessageDeliveryState.sent,
+          );
+      pendingOutgoing.remove(localId);
       mergeIncomingMessage(message);
       await loadChats();
     } catch (_) {
-      replaceLocalMessage(localMessage.copyWith(uploading: false));
+      replaceLocalMessage(
+        localMessage.copyWith(
+          uploading: false,
+          deliveryState: MessageDeliveryState.failed,
+        ),
+      );
+    } finally {
+      sendChatActivity(chat.id, ChatActivityKind.uploading, active: false);
     }
   }
 
@@ -2467,6 +3234,8 @@ class _MessengerHomeState extends State<MessengerHome>
       contacts: contacts,
       chats: chats,
       selectedChat: selectedChat,
+      peerActivities: peerActivities,
+      chatDrafts: chatDrafts,
       messages: selectedChat == null
           ? const []
           : messages[selectedChat!.id] ?? const [],
@@ -2479,10 +3248,16 @@ class _MessengerHomeState extends State<MessengerHome>
       onAddContact: addContact,
       onOpenChat: openChat,
       onSendMessage: sendMessage,
+      onSendAttachmentMessage: sendAttachmentMessage,
+      onRetryMessage: retryMessage,
+      onComposerActivity: sendChatActivity,
+      onDraftChanged: updateDraft,
       onEditMessage: editMessage,
       onDeleteMessages: deleteSelectedMessages,
       onReactToMessage: reactToMessage,
       onSetMessagePinned: setMessagePinned,
+      onSetChatPinned: setChatPinned,
+      onSetChatArchived: setChatArchived,
       onClearPinnedMessages: clearPinnedMessages,
       onSearchMessages: searchMessages,
       onSetAutoDeleteSeconds: setAutoDeleteSeconds,
@@ -2680,6 +3455,8 @@ class AppShell extends StatefulWidget {
     required this.contacts,
     required this.chats,
     required this.selectedChat,
+    required this.peerActivities,
+    required this.chatDrafts,
     required this.messages,
     required this.voiceCall,
     required this.onLogout,
@@ -2690,10 +3467,16 @@ class AppShell extends StatefulWidget {
     required this.onAddContact,
     required this.onOpenChat,
     required this.onSendMessage,
+    required this.onSendAttachmentMessage,
+    required this.onRetryMessage,
+    required this.onComposerActivity,
+    required this.onDraftChanged,
     required this.onEditMessage,
     required this.onDeleteMessages,
     required this.onReactToMessage,
     required this.onSetMessagePinned,
+    required this.onSetChatPinned,
+    required this.onSetChatArchived,
     required this.onClearPinnedMessages,
     required this.onSearchMessages,
     required this.onSetAutoDeleteSeconds,
@@ -2720,6 +3503,8 @@ class AppShell extends StatefulWidget {
   final List<UserProfile> contacts;
   final List<ChatSummary> chats;
   final ChatSummary? selectedChat;
+  final Map<String, PeerActivity> peerActivities;
+  final Map<String, String> chatDrafts;
   final List<ChatMessage> messages;
   final VoiceCallSession? voiceCall;
   final Future<void> Function() onLogout;
@@ -2731,12 +3516,30 @@ class AppShell extends StatefulWidget {
   final Future<void> Function(ChatSummary chat) onOpenChat;
   final Future<void> Function(String text, {ChatMessage? replyTo})
   onSendMessage;
+  final Future<void> Function(
+    MessageAttachment attachment,
+    Uint8List bytes, {
+    String text,
+    ChatMessage? replyTo,
+  })
+  onSendAttachmentMessage;
+  final Future<void> Function(ChatMessage message) onRetryMessage;
+  final void Function(
+    String chatId,
+    ChatActivityKind activity, {
+    required bool active,
+  })
+  onComposerActivity;
+  final void Function(String chatId, String value) onDraftChanged;
   final Future<void> Function(ChatMessage message, String text) onEditMessage;
   final Future<void> Function(List<ChatMessage> messages) onDeleteMessages;
   final Future<void> Function(ChatMessage message, String reaction)
   onReactToMessage;
   final Future<void> Function(ChatMessage message, bool pinned)
   onSetMessagePinned;
+  final Future<void> Function(ChatSummary chat, bool pinned) onSetChatPinned;
+  final Future<void> Function(ChatSummary chat, bool archived)
+  onSetChatArchived;
   final Future<void> Function(String chatId) onClearPinnedMessages;
   final Future<List<ChatMessage>> Function(String query) onSearchMessages;
   final Future<void> Function(int seconds) onSetAutoDeleteSeconds;
@@ -2776,6 +3579,7 @@ class _AppShellState extends State<AppShell> {
       contacts: widget.contacts,
       chats: widget.chats,
       selectedChat: widget.selectedChat,
+      peerActivities: widget.peerActivities,
       onModeChanged: (value) => setState(() => contactsMode = value),
       onLogout: widget.onLogout,
       onDeleteAccount: widget.onDeleteAccount,
@@ -2784,6 +3588,8 @@ class _AppShellState extends State<AppShell> {
       onSearch: widget.onSearch,
       onAddContact: widget.onAddContact,
       onOpenChat: widget.onOpenChat,
+      onSetChatPinned: widget.onSetChatPinned,
+      onSetChatArchived: widget.onSetChatArchived,
       onSeedDemoChats: widget.onSeedDemoChats,
     );
     final chat = ChatPane(
@@ -2792,8 +3598,18 @@ class _AppShellState extends State<AppShell> {
       chat: widget.selectedChat,
       apiBaseUrl: widget.apiBaseUrl,
       messages: widget.messages,
+      peerActivity: widget.selectedChat == null
+          ? null
+          : widget.peerActivities[widget.selectedChat!.id],
+      draftText: widget.selectedChat == null
+          ? ''
+          : widget.chatDrafts[widget.selectedChat!.id] ?? '',
       onBack: wide ? null : widget.onCloseChat,
       onSend: widget.onSendMessage,
+      onSendAttachment: widget.onSendAttachmentMessage,
+      onRetryMessage: widget.onRetryMessage,
+      onComposerActivity: widget.onComposerActivity,
+      onDraftChanged: widget.onDraftChanged,
       onEditMessage: widget.onEditMessage,
       onDeleteMessages: widget.onDeleteMessages,
       onReactToMessage: widget.onReactToMessage,
@@ -2971,6 +3787,7 @@ class Sidebar extends StatefulWidget {
     required this.contacts,
     required this.chats,
     required this.selectedChat,
+    required this.peerActivities,
     required this.onModeChanged,
     required this.onLogout,
     required this.onDeleteAccount,
@@ -2979,6 +3796,8 @@ class Sidebar extends StatefulWidget {
     required this.onSearch,
     required this.onAddContact,
     required this.onOpenChat,
+    required this.onSetChatPinned,
+    required this.onSetChatArchived,
     required this.onSeedDemoChats,
   });
 
@@ -2995,6 +3814,7 @@ class Sidebar extends StatefulWidget {
   final List<UserProfile> contacts;
   final List<ChatSummary> chats;
   final ChatSummary? selectedChat;
+  final Map<String, PeerActivity> peerActivities;
   final ValueChanged<bool> onModeChanged;
   final Future<void> Function() onLogout;
   final Future<void> Function() onDeleteAccount;
@@ -3003,6 +3823,9 @@ class Sidebar extends StatefulWidget {
   final Future<List<UserProfile>> Function(String username) onSearch;
   final Future<void> Function(String username) onAddContact;
   final Future<void> Function(ChatSummary chat) onOpenChat;
+  final Future<void> Function(ChatSummary chat, bool pinned) onSetChatPinned;
+  final Future<void> Function(ChatSummary chat, bool archived)
+  onSetChatArchived;
   final Future<void> Function() onSeedDemoChats;
 
   @override
@@ -3014,6 +3837,7 @@ class _SidebarState extends State<Sidebar> {
   List<UserProfile> results = const [];
   bool searching = false;
   bool seedingDemo = false;
+  ChatListFilter chatFilter = ChatListFilter.active;
 
   @override
   void dispose() {
@@ -3274,6 +4098,59 @@ class _SidebarState extends State<Sidebar> {
     );
   }
 
+  Future<void> showChatMenu(ChatSummary chat) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      showDragHandle: false,
+      builder: (context) {
+        final palette = AppPalette.of(context);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: palette.surface,
+                borderRadius: BorderRadius.circular(22),
+                border: Border.all(color: palette.divider),
+                boxShadow: premiumShadow(palette, opacity: 0.20),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ListTile(
+                    leading: Icon(
+                      chat.pinned ? Icons.push_pin : Icons.push_pin_outlined,
+                    ),
+                    title: Text(chat.pinned ? 'Unpin chat' : 'Pin chat'),
+                    onTap: () => Navigator.of(context).pop('pin'),
+                  ),
+                  ListTile(
+                    leading: Icon(
+                      chat.archived
+                          ? Icons.unarchive_outlined
+                          : Icons.archive_outlined,
+                    ),
+                    title: Text(
+                      chat.archived ? 'Unarchive chat' : 'Archive chat',
+                    ),
+                    onTap: () => Navigator.of(context).pop('archive'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    if (action == 'pin') {
+      await widget.onSetChatPinned(chat, !chat.pinned);
+    } else if (action == 'archive') {
+      await widget.onSetChatArchived(chat, !chat.archived);
+    }
+  }
+
   Widget chatsView(BuildContext context) {
     final s = widget.strings;
     final palette = AppPalette.of(context);
@@ -3316,9 +4193,23 @@ class _SidebarState extends State<Sidebar> {
       );
     }
     final query = search.text.trim().toLowerCase();
+    final filteredByMode =
+        widget.chats.where((chat) {
+          switch (chatFilter) {
+            case ChatListFilter.active:
+              return !chat.archived;
+            case ChatListFilter.unread:
+              return !chat.archived && chat.unreadCount > 0;
+            case ChatListFilter.archived:
+              return chat.archived;
+          }
+        }).toList()..sort((a, b) {
+          if (a.pinned != b.pinned) return a.pinned ? -1 : 1;
+          return (b.lastAt ?? '').compareTo(a.lastAt ?? '');
+        });
     final visibleChats = query.isEmpty
-        ? widget.chats
-        : widget.chats
+        ? filteredByMode
+        : filteredByMode
               .where(
                 (chat) =>
                     chat.peerDisplayName.toLowerCase().contains(query) ||
@@ -3326,82 +4217,210 @@ class _SidebarState extends State<Sidebar> {
                     lastMessagePreview(chat).toLowerCase().contains(query),
               )
               .toList();
-    return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(10, 2, 10, 14),
-      itemCount: visibleChats.length,
-      itemBuilder: (context, index) {
-        final chat = visibleChats[index];
-        final lastAt = chat.lastAt == null ? '' : messageClock(chat.lastAt!);
-        final selected = widget.selectedChat?.id == chat.id;
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 4),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(15),
-            onTap: () => widget.onOpenChat(chat),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 160),
-              constraints: const BoxConstraints(minHeight: 62),
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-              decoration: BoxDecoration(
-                color: selected ? palette.selectedRow : Colors.transparent,
-                borderRadius: BorderRadius.circular(15),
-              ),
-              child: Row(
-                children: [
-                  PresenceAvatar(
-                    apiBaseUrl: widget.apiBaseUrl,
-                    name: chat.peerDisplayName,
-                    avatarUrl: chat.peerAvatarUrl,
-                    online: chat.peerOnline,
-                    radius: 17,
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+          child: PremiumSegmented<ChatListFilter>(
+            values: ChatListFilter.values,
+            selected: chatFilter,
+            labelFor: (value) => switch (value) {
+              ChatListFilter.active => 'All',
+              ChatListFilter.unread => 'Unread',
+              ChatListFilter.archived => 'Archive',
+            },
+            iconFor: (value) => switch (value) {
+              ChatListFilter.active => Icons.inbox_outlined,
+              ChatListFilter.unread => Icons.mark_chat_unread_outlined,
+              ChatListFilter.archived => Icons.archive_outlined,
+            },
+            onChanged: (value) => setState(() => chatFilter = value),
+          ),
+        ),
+        Expanded(
+          child: visibleChats.isEmpty
+              ? Center(
+                  child: Text(
+                    chatFilter == ChatListFilter.archived
+                        ? 'No archived chats'
+                        : 'No chats match this filter',
+                    style: TextStyle(color: palette.textMuted),
                   ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Text(
-                          chat.peerDisplayName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w700,
-                            fontSize: 14,
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(10, 2, 10, 14),
+                  itemCount: visibleChats.length,
+                  itemBuilder: (context, index) {
+                    final chat = visibleChats[index];
+                    final activity = widget.peerActivities[chat.id];
+                    final activityText = activity?.active == true
+                        ? activityLabel(activity!.kind)
+                        : null;
+                    final lastAt = chat.lastAt == null
+                        ? ''
+                        : messageClock(chat.lastAt!);
+                    final selected = widget.selectedChat?.id == chat.id;
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(15),
+                        onTap: () => widget.onOpenChat(chat),
+                        onLongPress: () => showChatMenu(chat),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 160),
+                          constraints: const BoxConstraints(minHeight: 62),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 9,
                           ),
-                        ),
-                        const SizedBox(height: 3),
-                        Text(
-                          chat.lastAt == null
-                              ? peerStatus(chat)
-                              : '${lastMessagePreview(chat)}  ${chat.peerOnline ? 'online' : peerStatus(chat)}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: palette.textMuted,
-                            fontSize: 12,
+                          decoration: BoxDecoration(
+                            color: selected
+                                ? palette.selectedRow
+                                : Colors.transparent,
+                            borderRadius: BorderRadius.circular(15),
                           ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (lastAt.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 3),
-                      child: Text(
-                        lastAt,
-                        style: TextStyle(
-                          color: palette.textMuted,
-                          fontSize: 11,
+                          child: Row(
+                            children: [
+                              PresenceAvatar(
+                                apiBaseUrl: widget.apiBaseUrl,
+                                name: chat.peerDisplayName,
+                                avatarUrl: chat.peerAvatarUrl,
+                                online: chat.peerOnline,
+                                radius: 17,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        if (chat.pinned) ...[
+                                          Icon(
+                                            Icons.push_pin,
+                                            size: 13,
+                                            color: palette.accentStrong,
+                                          ),
+                                          const SizedBox(width: 4),
+                                        ],
+                                        Expanded(
+                                          child: Text(
+                                            chat.peerDisplayName,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.w700,
+                                              fontSize: 14,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 3),
+                                    Text(
+                                      activityText ??
+                                          (chat.lastAt == null
+                                              ? peerStatus(chat)
+                                              : '${lastMessagePreview(chat)}  ${chat.peerOnline ? 'online' : peerStatus(chat)}'),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        color: activityText == null
+                                            ? palette.textMuted
+                                            : palette.accentStrong,
+                                        fontSize: 12,
+                                        fontWeight: activityText == null
+                                            ? FontWeight.w400
+                                            : FontWeight.w700,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  if (lastAt.isNotEmpty)
+                                    Text(
+                                      lastAt,
+                                      style: TextStyle(
+                                        color: palette.textMuted,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  if (chat.unreadCount > 0) ...[
+                                    const SizedBox(height: 5),
+                                    Container(
+                                      constraints: const BoxConstraints(
+                                        minWidth: 20,
+                                      ),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
+                                        vertical: 2,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: palette.accent,
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                      child: Text(
+                                        chat.unreadCount > 99
+                                            ? '99+'
+                                            : chat.unreadCount.toString(),
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          color: palette.textOnOutgoing,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                              PopupMenuButton<String>(
+                                tooltip: 'Chat actions',
+                                icon: Icon(
+                                  Icons.more_vert,
+                                  color: palette.textMuted,
+                                  size: 20,
+                                ),
+                                onSelected: (value) async {
+                                  if (value == 'pin') {
+                                    await widget.onSetChatPinned(
+                                      chat,
+                                      !chat.pinned,
+                                    );
+                                  } else if (value == 'archive') {
+                                    await widget.onSetChatArchived(
+                                      chat,
+                                      !chat.archived,
+                                    );
+                                  }
+                                },
+                                itemBuilder: (context) => [
+                                  PopupMenuItem(
+                                    value: 'pin',
+                                    child: Text(chat.pinned ? 'Unpin' : 'Pin'),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 'archive',
+                                    child: Text(
+                                      chat.archived ? 'Unarchive' : 'Archive',
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
                         ),
                       ),
-                    ),
-                ],
-              ),
-            ),
-          ),
-        );
-      },
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 
@@ -3898,8 +4917,14 @@ class ChatPane extends StatefulWidget {
     required this.chat,
     required this.apiBaseUrl,
     required this.messages,
+    required this.peerActivity,
+    required this.draftText,
     required this.onBack,
     required this.onSend,
+    required this.onSendAttachment,
+    required this.onRetryMessage,
+    required this.onComposerActivity,
+    required this.onDraftChanged,
     required this.onEditMessage,
     required this.onDeleteMessages,
     required this.onReactToMessage,
@@ -3916,8 +4941,25 @@ class ChatPane extends StatefulWidget {
   final ChatSummary? chat;
   final String apiBaseUrl;
   final List<ChatMessage> messages;
+  final PeerActivity? peerActivity;
+  final String draftText;
   final VoidCallback? onBack;
   final Future<void> Function(String text, {ChatMessage? replyTo}) onSend;
+  final Future<void> Function(
+    MessageAttachment attachment,
+    Uint8List bytes, {
+    String text,
+    ChatMessage? replyTo,
+  })
+  onSendAttachment;
+  final Future<void> Function(ChatMessage message) onRetryMessage;
+  final void Function(
+    String chatId,
+    ChatActivityKind activity, {
+    required bool active,
+  })
+  onComposerActivity;
+  final void Function(String chatId, String value) onDraftChanged;
   final Future<void> Function(ChatMessage message, String text) onEditMessage;
   final Future<void> Function(List<ChatMessage> messages) onDeleteMessages;
   final Future<void> Function(ChatMessage message, String reaction)
@@ -3954,11 +4996,19 @@ class _ChatPaneState extends State<ChatPane> {
   ChatMessage? replyingTo;
   String? swipingMessageId;
   double swipeOffset = 0;
+  Timer? typingStopTimer;
+  bool typingActive = false;
 
   @override
   void initState() {
     super.initState();
+    text.text = widget.draftText;
     text.addListener(() {
+      final chatId = widget.chat?.id;
+      if (chatId != null) {
+        widget.onDraftChanged(chatId, text.text);
+        updateTypingActivity(chatId);
+      }
       if (mounted) setState(() {});
     });
     playerCompleteSub = voicePlayer.onPlayerComplete.listen((_) {
@@ -3974,6 +5024,8 @@ class _ChatPaneState extends State<ChatPane> {
     text.dispose();
     search.dispose();
     scroll.dispose();
+    typingStopTimer?.cancel();
+    stopTypingActivity();
     playerCompleteSub?.cancel();
     voicePlayer.dispose();
     unawaited(voiceRecorder.dispose());
@@ -3985,6 +5037,11 @@ class _ChatPaneState extends State<ChatPane> {
     super.didUpdateWidget(oldWidget);
     if (widget.chat?.id != oldWidget.chat?.id ||
         widget.messages.length != oldWidget.messages.length) {
+      if (widget.chat?.id != oldWidget.chat?.id) {
+        typingStopTimer?.cancel();
+        typingActive = false;
+        text.text = widget.draftText;
+      }
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => scheduleScrollToBottom(),
       );
@@ -4017,9 +5074,35 @@ class _ChatPaneState extends State<ChatPane> {
     );
   }
 
+  void updateTypingActivity(String chatId) {
+    if (text.text.trim().isEmpty || recordingVoice) {
+      stopTypingActivity();
+      return;
+    }
+    if (!typingActive) {
+      typingActive = true;
+      widget.onComposerActivity(chatId, ChatActivityKind.typing, active: true);
+    }
+    typingStopTimer?.cancel();
+    typingStopTimer = Timer(const Duration(milliseconds: 1400), () {
+      stopTypingActivity();
+    });
+  }
+
+  void stopTypingActivity() {
+    final chatId = widget.chat?.id;
+    if (chatId != null && typingActive) {
+      widget.onComposerActivity(chatId, ChatActivityKind.typing, active: false);
+    }
+    typingActive = false;
+    typingStopTimer?.cancel();
+    typingStopTimer = null;
+  }
+
   Future<void> submit() async {
     final value = text.text;
     text.clear();
+    stopTypingActivity();
     final editing = editingMessage;
     if (editing == null) {
       final reply = replyingTo;
@@ -4083,7 +5166,12 @@ class _ChatPaneState extends State<ChatPane> {
   }
 
   void startEdit(ChatMessage message) {
-    if (message.senderId != widget.user.id || message.voiceUrl != null) return;
+    if (message.senderId != widget.user.id ||
+        message.voiceUrl != null ||
+        message.localVoicePath != null ||
+        message.attachment != null) {
+      return;
+    }
     setState(() {
       editingMessage = message;
       replyingTo = null;
@@ -4265,7 +5353,10 @@ class _ChatPaneState extends State<ChatPane> {
                         ),
                         if (message.text.trim().isNotEmpty)
                           item('copy', 'Copy'),
-                        if (mine && message.voiceUrl == null)
+                        if (mine &&
+                            message.voiceUrl == null &&
+                            message.localVoicePath == null &&
+                            message.attachment == null)
                           item('edit', 'Edit'),
                         item('select', 'Select'),
                         item('delete', 'Delete'),
@@ -4371,6 +5462,121 @@ class _ChatPaneState extends State<ChatPane> {
     }
   }
 
+  Future<void> showAttachmentMenu() async {
+    if (recordingVoice || editingMessage != null) return;
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      showDragHandle: false,
+      builder: (context) {
+        final palette = AppPalette.of(context);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: palette.surface,
+                borderRadius: BorderRadius.circular(22),
+                border: Border.all(color: palette.divider),
+                boxShadow: premiumShadow(palette, opacity: 0.20),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  bottomSheetOption(
+                    context,
+                    icon: Icons.photo_outlined,
+                    title: 'Photo',
+                    onTap: () => Navigator.of(context).pop('photo'),
+                  ),
+                  bottomSheetOption(
+                    context,
+                    icon: Icons.description_outlined,
+                    title: 'Document',
+                    onTap: () => Navigator.of(context).pop('document'),
+                  ),
+                  bottomSheetOption(
+                    context,
+                    icon: Icons.attach_file,
+                    title: 'File',
+                    onTap: () => Navigator.of(context).pop('file'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    if (action == 'photo') {
+      await pickPhotoAttachment();
+    } else if (action == 'document') {
+      await pickFileAttachment(forceDocument: true);
+    } else if (action == 'file') {
+      await pickFileAttachment();
+    }
+  }
+
+  Future<void> pickPhotoAttachment() async {
+    final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    final fileName = picked.name.isEmpty
+        ? 'photo_${DateTime.now().millisecondsSinceEpoch}.jpg'
+        : picked.name;
+    final attachment = MessageAttachment(
+      kind: AttachmentKind.photo,
+      fileName: fileName,
+      localPath: picked.path,
+      localBytes: bytes,
+      mimeType: picked.mimeType ?? 'image/jpeg',
+      sizeBytes: bytes.length,
+    );
+    final caption = text.text.trim();
+    text.clear();
+    final reply = replyingTo;
+    setState(() => replyingTo = null);
+    await widget.onSendAttachment(
+      attachment,
+      bytes,
+      text: caption,
+      replyTo: reply,
+    );
+  }
+
+  Future<void> pickFileAttachment({bool forceDocument = false}) async {
+    final result = await FilePicker.platform.pickFiles(withData: kIsWeb);
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.single;
+    Uint8List? bytes = file.bytes;
+    if (bytes == null && file.path != null) {
+      bytes = await XFile(file.path!).readAsBytes();
+    }
+    if (bytes == null) return;
+    final kind = forceDocument
+        ? AttachmentKind.document
+        : attachmentKindFor(file.name, file.extension);
+    final attachment = MessageAttachment(
+      kind: kind,
+      fileName: file.name,
+      localPath: file.path,
+      localBytes: kind == AttachmentKind.photo ? bytes : null,
+      mimeType: file.extension,
+      sizeBytes: file.size > 0 ? file.size : bytes.length,
+    );
+    final caption = text.text.trim();
+    text.clear();
+    final reply = replyingTo;
+    setState(() => replyingTo = null);
+    await widget.onSendAttachment(
+      attachment,
+      bytes,
+      text: caption,
+      replyTo: reply,
+    );
+  }
+
   Future<void> startVoiceRecord() async {
     if (recordingVoice) return;
     try {
@@ -4391,6 +5597,15 @@ class _ChatPaneState extends State<ChatPane> {
         recordStartedAt = DateTime.now();
         recordingVoice = true;
       });
+      final chatId = widget.chat?.id;
+      if (chatId != null) {
+        stopTypingActivity();
+        widget.onComposerActivity(
+          chatId,
+          ChatActivityKind.recording,
+          active: true,
+        );
+      }
     } catch (_) {}
   }
 
@@ -4402,6 +5617,14 @@ class _ChatPaneState extends State<ChatPane> {
       recordStartedAt = null;
       recordingVoice = false;
     });
+    final chatId = widget.chat?.id;
+    if (chatId != null) {
+      widget.onComposerActivity(
+        chatId,
+        ChatActivityKind.recording,
+        active: false,
+      );
+    }
     if (send && started != null && path != null) {
       final duration = DateTime.now()
           .difference(started)
@@ -4519,6 +5742,229 @@ class _ChatPaneState extends State<ChatPane> {
     );
   }
 
+  Future<void> openAttachment(MessageAttachment attachment) async {
+    if (!kIsWeb &&
+        attachment.localPath != null &&
+        attachment.localPath!.isNotEmpty) {
+      await OpenFilex.open(attachment.localPath!);
+      return;
+    }
+    final url = mediaUrl(widget.apiBaseUrl, attachment.url);
+    if (url.isEmpty) return;
+    await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+  }
+
+  Widget buildAttachmentMessage(
+    BuildContext context,
+    ChatMessage message,
+    bool mine,
+  ) {
+    final attachment = message.attachment;
+    if (attachment == null) return const SizedBox.shrink();
+    final palette = AppPalette.of(context);
+    final textColor = mine ? palette.textOnOutgoing : palette.textPrimary;
+    final muted = mine
+        ? palette.textOnOutgoing.withValues(alpha: 0.76)
+        : palette.textMuted;
+    final thumbnail = attachment.thumbnailUrl ?? attachment.url;
+    if (attachment.kind == AttachmentKind.photo) {
+      Widget image;
+      if (attachment.localBytes != null) {
+        image = Image.memory(attachment.localBytes!, fit: BoxFit.cover);
+      } else {
+        final url = mediaUrl(widget.apiBaseUrl, thumbnail);
+        image = url.isEmpty
+            ? Icon(Icons.image_outlined, size: 44, color: muted)
+            : Image.network(url, fit: BoxFit.cover);
+      }
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: InkWell(
+              onTap: () => openAttachment(attachment),
+              child: SizedBox(
+                width: 260,
+                height: 180,
+                child: ColoredBox(color: palette.surfaceSoft, child: image),
+              ),
+            ),
+          ),
+          if (message.text.trim().isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              message.text,
+              style: TextStyle(color: textColor, fontSize: 14, height: 1.34),
+            ),
+          ],
+        ],
+      );
+    }
+    return InkWell(
+      onTap: () => openAttachment(attachment),
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        constraints: const BoxConstraints(minWidth: 230, maxWidth: 310),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: mine
+              ? palette.textOnOutgoing.withValues(alpha: 0.14)
+              : palette.surfaceSoft,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: mine
+                ? palette.textOnOutgoing.withValues(alpha: 0.18)
+                : palette.divider,
+          ),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 42,
+              height: 42,
+              decoration: BoxDecoration(
+                color: palette.accentSoft,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(attachmentIcon(attachment.kind), color: textColor),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    attachment.fileName,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: textColor,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    [
+                      attachment.kind == AttachmentKind.document
+                          ? 'Document'
+                          : 'File',
+                      formatBytes(attachment.sizeBytes),
+                    ].where((value) => value.isNotEmpty).join(' - '),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: muted, fontSize: 12),
+                  ),
+                  if (message.text.trim().isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      message.text,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: textColor, fontSize: 13),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget buildLinkPreview(
+    BuildContext context,
+    ChatMessage message,
+    bool mine,
+  ) {
+    final preview = message.linkPreview;
+    if (preview == null) return const SizedBox.shrink();
+    final palette = AppPalette.of(context);
+    final textColor = mine ? palette.textOnOutgoing : palette.textPrimary;
+    final muted = mine
+        ? palette.textOnOutgoing.withValues(alpha: 0.74)
+        : palette.textMuted;
+    final domain = preview.domain ?? domainForUrl(preview.url);
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: InkWell(
+        onTap: preview.url == null
+            ? null
+            : () => launchUrl(
+                Uri.parse(preview.url!),
+                mode: LaunchMode.externalApplication,
+              ),
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 320),
+          padding: const EdgeInsets.all(9),
+          decoration: BoxDecoration(
+            color: mine
+                ? palette.textOnOutgoing.withValues(alpha: 0.13)
+                : palette.surfaceSoft,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: mine
+                  ? palette.textOnOutgoing.withValues(alpha: 0.18)
+                  : palette.divider,
+            ),
+          ),
+          child: Row(
+            children: [
+              if (preview.thumbnailUrl != null) ...[
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(9),
+                  child: Image.network(
+                    mediaUrl(widget.apiBaseUrl, preview.thumbnailUrl),
+                    width: 58,
+                    height: 58,
+                    fit: BoxFit.cover,
+                  ),
+                ),
+                const SizedBox(width: 10),
+              ],
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (domain.isNotEmpty)
+                      Text(
+                        domain,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: muted,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    Text(
+                      preview.title ?? preview.url ?? 'Link',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: textColor,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    if (preview.description?.isNotEmpty == true)
+                      Text(
+                        preview.description!,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: muted, fontSize: 12),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget buildReplyPreview(
     BuildContext context,
     ChatMessage message,
@@ -4528,6 +5974,8 @@ class _ChatPaneState extends State<ChatPane> {
     final title = message.replyToSenderName ?? 'Reply';
     final text = message.replyToType == 'voice'
         ? 'Voice message'
+        : message.replyToType == 'attachment'
+        ? 'Attachment'
         : (message.replyToText ?? '');
     if (message.replyToMessageId == null || text.isEmpty) {
       return const SizedBox.shrink();
@@ -4576,6 +6024,31 @@ class _ChatPaneState extends State<ChatPane> {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (message.deliveryState == MessageDeliveryState.failed) ...[
+          TextButton.icon(
+            onPressed: () => widget.onRetryMessage(message),
+            icon: Icon(Icons.refresh, size: 14, color: palette.danger),
+            label: Text(
+              'retry',
+              style: TextStyle(color: palette.danger, fontSize: 11),
+            ),
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              minimumSize: const Size(0, 24),
+            ),
+          ),
+          const SizedBox(width: 4),
+        ] else if (message.deliveryState == MessageDeliveryState.sending ||
+            message.uploading) ...[
+          SizedBox(
+            width: 12,
+            height: 12,
+            child: CircularProgressIndicator(strokeWidth: 1.5, color: color),
+          ),
+          const SizedBox(width: 5),
+        ],
         if (message.editedAt != null) ...[
           Text(
             'edited',
@@ -4594,9 +6067,17 @@ class _ChatPaneState extends State<ChatPane> {
         if (mine) ...[
           const SizedBox(width: 3),
           Icon(
-            message.readByPeer ? Icons.done_all : Icons.done,
+            message.deliveryState == MessageDeliveryState.failed
+                ? Icons.error_outline
+                : message.readByPeer
+                ? Icons.done_all
+                : Icons.done,
             size: 16,
-            color: message.readByPeer ? palette.accentStrong : color,
+            color: message.deliveryState == MessageDeliveryState.failed
+                ? palette.danger
+                : message.readByPeer
+                ? palette.accentStrong
+                : color,
           ),
         ],
       ],
@@ -4675,6 +6156,9 @@ class _ChatPaneState extends State<ChatPane> {
         selected.length == 1 && selected.first.senderId == widget.user.id;
     final hasText = text.text.trim().isNotEmpty;
     final sendTextMode = hasText || editingMessage != null;
+    final peerActivityText = widget.peerActivity?.active == true
+        ? activityLabel(widget.peerActivity!.kind)
+        : null;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onHorizontalDragUpdate: widget.onBack == null
@@ -4768,12 +6252,17 @@ class _ChatPaneState extends State<ChatPane> {
                             ),
                           ),
                           Text(
-                            peerStatus(chat),
+                            peerActivityText ?? peerStatus(chat),
                             style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(
-                                  color: chat.peerOnline
+                                  color: peerActivityText != null
+                                      ? palette.accentStrong
+                                      : chat.peerOnline
                                       ? palette.accent
                                       : palette.textMuted,
+                                  fontWeight: peerActivityText != null
+                                      ? FontWeight.w700
+                                      : FontWeight.w400,
                                 ),
                           ),
                         ],
@@ -4862,10 +6351,7 @@ class _ChatPaneState extends State<ChatPane> {
                                 ),
                           ),
                           Text(
-                            pinned.first.voiceUrl != null ||
-                                    pinned.first.localVoicePath != null
-                                ? 'Voice message'
-                                : pinned.first.text,
+                            messageContentLabel(pinned.first),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(color: palette.textMuted),
@@ -5008,6 +6494,12 @@ class _ChatPaneState extends State<ChatPane> {
                                     if (message.voiceUrl != null ||
                                         message.localVoicePath != null)
                                       buildVoiceMessage(context, message, mine)
+                                    else if (message.attachment != null)
+                                      buildAttachmentMessage(
+                                        context,
+                                        message,
+                                        mine,
+                                      )
                                     else
                                       Text(
                                         message.text,
@@ -5019,6 +6511,7 @@ class _ChatPaneState extends State<ChatPane> {
                                           height: 1.34,
                                         ),
                                       ),
+                                    buildLinkPreview(context, message, mine),
                                     if (message.reactions.isNotEmpty)
                                       Padding(
                                         padding: const EdgeInsets.only(top: 6),
@@ -5117,11 +6610,7 @@ class _ChatPaneState extends State<ChatPane> {
                                         ),
                                       ),
                                       Text(
-                                        replyingTo!.voiceUrl != null ||
-                                                replyingTo!.localVoicePath !=
-                                                    null
-                                            ? 'Voice message'
-                                            : replyingTo!.text,
+                                        messageContentLabel(replyingTo!),
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
                                       ),
@@ -5150,6 +6639,13 @@ class _ChatPaneState extends State<ChatPane> {
                               icon: Icons.close,
                               tooltip: 'Cancel voice message',
                               onPressed: () => stopVoiceRecord(send: false),
+                            ),
+                            const SizedBox(width: 8),
+                          ] else ...[
+                            PremiumIconButton(
+                              icon: Icons.attach_file,
+                              tooltip: 'Attach',
+                              onPressed: showAttachmentMenu,
                             ),
                             const SizedBox(width: 8),
                           ],

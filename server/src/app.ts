@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z, ZodError } from 'zod';
 import { openDb, type Db } from './db.js';
+import { fetchLinkPreview, firstHttpUrl } from './linkPreview.js';
 import { pushConfigured, sendPushToUsers } from './push.js';
 import { addClient, broadcastToUsers, closeSocket, onlineUserIds } from './realtime.js';
 import type { MessageView, User } from './types.js';
@@ -45,15 +46,48 @@ const chatSettingsSchema = z.object({
   autoDeleteSeconds: z.number().int().min(60).max(31_536_000).nullable()
 });
 
+const chatUserSettingsSchema = z.object({
+  pinned: z.boolean().optional(),
+  archived: z.boolean().optional()
+}).refine((value) => value.pinned !== undefined || value.archived !== undefined, 'At least one setting is required');
+
 const pushTokenSchema = z.object({
   token: z.string().trim().min(20).max(4096),
   platform: z.enum(['android'])
 });
 
+const indicatorSchema = z.object({
+  type: z.enum(['typing.start', 'typing.stop', 'recording.start', 'recording.stop', 'uploading.start', 'uploading.stop']),
+  chatId: z.string().min(1)
+});
+
+const attachmentTypes: Record<string, { extension: string; messageType: 'photo' | 'file' | 'document' }> = {
+  'image/jpeg': { extension: 'jpg', messageType: 'photo' },
+  'image/png': { extension: 'png', messageType: 'photo' },
+  'image/webp': { extension: 'webp', messageType: 'photo' },
+  'image/gif': { extension: 'gif', messageType: 'photo' },
+  'application/pdf': { extension: 'pdf', messageType: 'document' },
+  'application/msword': { extension: 'doc', messageType: 'document' },
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': { extension: 'docx', messageType: 'document' },
+  'application/vnd.ms-excel': { extension: 'xls', messageType: 'document' },
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': { extension: 'xlsx', messageType: 'document' },
+  'application/zip': { extension: 'zip', messageType: 'file' },
+  'application/octet-stream': { extension: 'bin', messageType: 'file' }
+};
+
+const maxAttachmentBytes = 25 * 1024 * 1024;
+
 function dataDirectory() {
   const dbPath = process.env.DATABASE_URL ?? path.join(process.cwd(), 'data', 'messenger.sqlite');
   const normalized = dbPath.startsWith('file:') ? dbPath.slice(5) : dbPath;
   return path.dirname(path.resolve(normalized));
+}
+
+function safeClientFilename(value: unknown) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  const base = path.basename(raw).replace(/[^\w .()-]/g, '_').replace(/\s+/g, ' ').slice(0, 160).trim();
+  return base || null;
 }
 
 const callSignalSchema = z.discriminatedUnion('type', [
@@ -171,10 +205,45 @@ function chatSettings(db: Db, chatId: string) {
   };
 }
 
+function upsertChatUserSettings(db: Db, chatId: string, userId: string, patch: { pinned?: boolean; archived?: boolean }) {
+  const current = db.prepare('SELECT pinned_at AS pinnedAt, archived_at AS archivedAt FROM chat_user_settings WHERE chat_id = ? AND user_id = ?').get(chatId, userId) as any | undefined;
+  const updatedAt = nowIso();
+  const pinnedAt = patch.pinned === undefined ? current?.pinnedAt ?? null : patch.pinned ? current?.pinnedAt ?? updatedAt : null;
+  const archivedAt = patch.archived === undefined ? current?.archivedAt ?? null : patch.archived ? current?.archivedAt ?? updatedAt : null;
+  db.prepare(`
+    INSERT INTO chat_user_settings (chat_id, user_id, pinned_at, archived_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(chat_id, user_id) DO UPDATE SET
+      pinned_at = excluded.pinned_at,
+      archived_at = excluded.archived_at,
+      updated_at = excluded.updated_at
+  `).run(chatId, userId, pinnedAt, archivedAt, updatedAt);
+  return {
+    chatId,
+    pinned: Boolean(pinnedAt),
+    archived: Boolean(archivedAt),
+    pinnedAt,
+    archivedAt,
+    updatedAt
+  };
+}
+
 function sweepExpiredMessages(db: Db, chatId: string) {
   db.prepare(`
     UPDATE messages
-    SET deleted_at = ?, text = '', media_url = NULL, duration_ms = NULL
+    SET deleted_at = ?,
+        text = '',
+        media_url = NULL,
+        duration_ms = NULL,
+        filename = NULL,
+        mime_type = NULL,
+        size_bytes = NULL,
+        thumbnail_url = NULL,
+        preview_url = NULL,
+        preview_title = NULL,
+        preview_description = NULL,
+        preview_image_url = NULL,
+        preview_domain = NULL
     WHERE chat_id = ?
       AND deleted_at IS NULL
       AND auto_delete_at IS NOT NULL
@@ -197,6 +266,32 @@ function messageReactions(db: Db, messageId: string) {
   }));
 }
 
+function messageFromRow(message: Omit<MessageView, 'reactions' | 'linkPreview'> & {
+  previewUrl: string | null;
+  previewTitle: string | null;
+  previewDescription: string | null;
+  previewImageUrl: string | null;
+  previewDomain: string | null;
+}) {
+  return {
+    ...message,
+    linkPreview: message.previewUrl && message.previewDomain
+      ? {
+          url: message.previewUrl,
+          title: message.previewTitle,
+          description: message.previewDescription,
+          imageUrl: message.previewImageUrl,
+          domain: message.previewDomain
+        }
+      : null,
+    previewUrl: undefined,
+    previewTitle: undefined,
+    previewDescription: undefined,
+    previewImageUrl: undefined,
+    previewDomain: undefined
+  } as Omit<MessageView, 'reactions'>;
+}
+
 function messageView(db: Db, messageId: string) {
   const message = db.prepare(`
     SELECT m.id,
@@ -207,6 +302,15 @@ function messageView(db: Db, messageId: string) {
            m.text,
            m.media_url AS mediaUrl,
            m.duration_ms AS durationMs,
+           m.filename,
+           m.mime_type AS mimeType,
+           m.size_bytes AS sizeBytes,
+           m.thumbnail_url AS thumbnailUrl,
+           m.preview_url AS previewUrl,
+           m.preview_title AS previewTitle,
+           m.preview_description AS previewDescription,
+           m.preview_image_url AS previewImageUrl,
+           m.preview_domain AS previewDomain,
            m.reply_to_message_id AS replyToMessageId,
            rm.text AS replyToText,
            ru.display_name AS replyToSenderName,
@@ -221,9 +325,9 @@ function messageView(db: Db, messageId: string) {
     LEFT JOIN messages rm ON rm.id = m.reply_to_message_id AND rm.deleted_at IS NULL
     LEFT JOIN users ru ON ru.id = rm.sender_id
     WHERE m.id = ?
-  `).get(messageId) as Omit<MessageView, 'reactions'> | undefined;
+  `).get(messageId) as Parameters<typeof messageFromRow>[0] | undefined;
   if (!message) return undefined;
-  return { ...message, reactions: messageReactions(db, messageId) } as MessageView;
+  return { ...messageFromRow(message), reactions: messageReactions(db, messageId) } as MessageView;
 }
 
 function messageRows(db: Db, chatId: string, where = '', ...params: unknown[]) {
@@ -236,6 +340,15 @@ function messageRows(db: Db, chatId: string, where = '', ...params: unknown[]) {
            m.text,
            m.media_url AS mediaUrl,
            m.duration_ms AS durationMs,
+           m.filename,
+           m.mime_type AS mimeType,
+           m.size_bytes AS sizeBytes,
+           m.thumbnail_url AS thumbnailUrl,
+           m.preview_url AS previewUrl,
+           m.preview_title AS previewTitle,
+           m.preview_description AS previewDescription,
+           m.preview_image_url AS previewImageUrl,
+           m.preview_domain AS previewDomain,
            m.reply_to_message_id AS replyToMessageId,
            rm.text AS replyToText,
            ru.display_name AS replyToSenderName,
@@ -252,39 +365,65 @@ function messageRows(db: Db, chatId: string, where = '', ...params: unknown[]) {
     WHERE m.chat_id = ? ${where}
     ORDER BY m.created_at ASC
     LIMIT 200
-  `).all(chatId, ...params) as Array<Omit<MessageView, 'reactions'>>;
-  return rows.map((message) => ({ ...message, reactions: messageReactions(db, message.id) }));
+  `).all(chatId, ...params) as Array<Parameters<typeof messageFromRow>[0]>;
+  return rows.map((message) => ({ ...messageFromRow(message), reactions: messageReactions(db, message.id) }));
 }
 
 function userById(db: Db, userId: string) {
   return db.prepare('SELECT id, username, display_name, avatar_url FROM users WHERE id = ?').get(userId) as any | undefined;
 }
 
-function handleCallSignal(db: Db, user: User, raw: string) {
-  let event: z.infer<typeof callSignalSchema>;
+function senderPayload(db: Db, user: User) {
+  const sender = userById(db, user.id);
+  return {
+    id: user.id,
+    username: user.username,
+    displayName: sender?.display_name ?? user.displayName,
+    avatarUrl: sender?.avatar_url ?? user.avatarUrl ?? null
+  };
+}
+
+function handleIndicator(db: Db, user: User, raw: unknown) {
+  const parsed = indicatorSchema.safeParse(raw);
+  if (!parsed.success) return false;
+  const event = parsed.data;
+  if (!hasChatAccess(db, event.chatId, user.id)) return true;
+  const members = chatMembers(db, event.chatId);
+  if (members.length !== 2) return true;
+  broadcastToUsers(members.filter((userId) => userId !== user.id), {
+    type: event.type,
+    chatId: event.chatId,
+    from: senderPayload(db, user)
+  });
+  return true;
+}
+
+function handleRealtimeClientEvent(db: Db, user: User, raw: string) {
+  let decoded: unknown;
   try {
-    const decoded = JSON.parse(raw);
-    event = callSignalSchema.parse(decoded);
+    decoded = JSON.parse(raw);
   } catch {
     return;
   }
+  if (handleIndicator(db, user, decoded)) return;
+  handleCallSignal(db, user, decoded);
+}
+
+function handleCallSignal(db: Db, user: User, raw: unknown) {
+  const parsed = callSignalSchema.safeParse(raw);
+  if (!parsed.success) return;
+  const event = parsed.data;
 
   if (!hasChatAccess(db, event.chatId, user.id)) return;
   const members = chatMembers(db, event.chatId);
   if (members.length !== 2) return;
   const recipients = members.filter((userId) => userId !== user.id);
   if (recipients.length === 0) return;
-  const sender = userById(db, user.id);
   const base = {
     type: event.type,
     chatId: event.chatId,
     callId: event.callId,
-    from: {
-      id: user.id,
-      username: user.username,
-      displayName: sender?.display_name ?? user.displayName,
-      avatarUrl: sender?.avatar_url ?? user.avatarUrl ?? null
-    }
+    from: senderPayload(db, user)
   };
 
   if (event.type === 'call.offer' || event.type === 'call.answer') {
@@ -343,9 +482,11 @@ export function buildApp(options: { db?: Db } = {}) {
   const uploadsDir = path.resolve(process.env.UPLOADS_DIR ?? path.join(dataDirectory(), 'uploads'));
   const avatarsDir = path.join(uploadsDir, 'avatars');
   const voicesDir = path.join(uploadsDir, 'voices');
+  const attachmentsDir = path.join(uploadsDir, 'attachments');
 
   fs.mkdirSync(avatarsDir, { recursive: true });
   fs.mkdirSync(voicesDir, { recursive: true });
+  fs.mkdirSync(attachmentsDir, { recursive: true });
 
   app.decorate('db', db);
   app.setErrorHandler((error, request, reply) => {
@@ -366,8 +507,26 @@ export function buildApp(options: { db?: Db } = {}) {
   });
   app.register(cors, { origin: true, credentials: true });
   app.addContentTypeParser(
-    ['image/jpeg', 'image/png', 'image/webp', 'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/ogg', 'audio/webm', 'audio/wav', 'application/octet-stream'],
-    { parseAs: 'buffer', bodyLimit: 25 * 1024 * 1024 },
+    [
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+      'image/gif',
+      'audio/mpeg',
+      'audio/mp4',
+      'audio/aac',
+      'audio/ogg',
+      'audio/webm',
+      'audio/wav',
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/zip',
+      'application/octet-stream'
+    ],
+    { parseAs: 'buffer', bodyLimit: maxAttachmentBytes },
     (_request, body, done) => done(null, body)
   );
   app.register(websocket, {
@@ -393,13 +552,20 @@ export function buildApp(options: { db?: Db } = {}) {
       '.jpeg': 'image/jpeg',
       '.png': 'image/png',
       '.webp': 'image/webp',
+      '.gif': 'image/gif',
       '.m4a': 'audio/mp4',
       '.mp4': 'audio/mp4',
       '.aac': 'audio/aac',
       '.mp3': 'audio/mpeg',
       '.ogg': 'audio/ogg',
       '.webm': 'audio/webm',
-      '.wav': 'audio/wav'
+      '.wav': 'audio/wav',
+      '.pdf': 'application/pdf',
+      '.doc': 'application/msword',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      '.xls': 'application/vnd.ms-excel',
+      '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      '.zip': 'application/zip'
     };
     reply.type(contentTypeByExtension[extension] ?? 'application/octet-stream');
     return reply.send(fs.createReadStream(resolved));
@@ -570,15 +736,18 @@ export function buildApp(options: { db?: Db } = {}) {
              u.display_name AS peerDisplayName,
              u.avatar_url AS peerAvatarUrl,
              u.last_seen_at AS peerLastSeenAt,
+             cus.pinned_at AS pinnedAt,
+             cus.archived_at AS archivedAt,
              (SELECT text FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS lastText,
              (SELECT created_at FROM messages WHERE chat_id = c.id ORDER BY created_at DESC LIMIT 1) AS lastAt
       FROM chats c
       JOIN chat_members me ON me.chat_id = c.id AND me.user_id = ?
       JOIN chat_members other ON other.chat_id = c.id AND other.user_id <> ?
       JOIN users u ON u.id = other.user_id
-      ORDER BY COALESCE(lastAt, c.created_at) DESC
-    `).all(user.id, user.id);
-    return { chats: rows.map((row: any) => ({ ...row, peerOnline: online.has(row.peerId) })) };
+      LEFT JOIN chat_user_settings cus ON cus.chat_id = c.id AND cus.user_id = ?
+      ORDER BY CASE WHEN cus.pinned_at IS NULL THEN 1 ELSE 0 END, COALESCE(cus.pinned_at, lastAt, c.created_at) DESC, COALESCE(lastAt, c.created_at) DESC
+    `).all(user.id, user.id, user.id);
+    return { chats: rows.map((row: any) => ({ ...row, pinned: Boolean(row.pinnedAt), archived: Boolean(row.archivedAt), peerOnline: online.has(row.peerId) })) };
   });
 
   app.get('/api/chats/:chatId/messages', async (request, reply) => {
@@ -589,6 +758,53 @@ export function buildApp(options: { db?: Db } = {}) {
     sweepExpiredMessages(db, chatId);
     const messages = messageRows(db, chatId);
     return { messages };
+  });
+
+  app.patch('/api/chats/:chatId/user-settings', async (request, reply) => {
+    const user = await requireUser(request, reply, db);
+    if (!user) return;
+    const { chatId } = z.object({ chatId: z.string() }).parse(request.params);
+    const body = chatUserSettingsSchema.parse(request.body);
+    if (!hasChatAccess(db, chatId, user.id)) return reply.code(403).send({ error: 'forbidden' });
+    const settings = upsertChatUserSettings(db, chatId, user.id, body);
+    broadcastToUsers([user.id], { type: 'chat.user_settings', chatId, settings });
+    return { settings };
+  });
+
+  app.put('/api/chats/:chatId/pin', async (request, reply) => {
+    const user = await requireUser(request, reply, db);
+    if (!user) return;
+    const { chatId } = z.object({ chatId: z.string() }).parse(request.params);
+    if (!hasChatAccess(db, chatId, user.id)) return reply.code(403).send({ error: 'forbidden' });
+    const settings = upsertChatUserSettings(db, chatId, user.id, { pinned: true });
+    return { settings };
+  });
+
+  app.delete('/api/chats/:chatId/pin', async (request, reply) => {
+    const user = await requireUser(request, reply, db);
+    if (!user) return;
+    const { chatId } = z.object({ chatId: z.string() }).parse(request.params);
+    if (!hasChatAccess(db, chatId, user.id)) return reply.code(403).send({ error: 'forbidden' });
+    const settings = upsertChatUserSettings(db, chatId, user.id, { pinned: false });
+    return { settings };
+  });
+
+  app.put('/api/chats/:chatId/archive', async (request, reply) => {
+    const user = await requireUser(request, reply, db);
+    if (!user) return;
+    const { chatId } = z.object({ chatId: z.string() }).parse(request.params);
+    if (!hasChatAccess(db, chatId, user.id)) return reply.code(403).send({ error: 'forbidden' });
+    const settings = upsertChatUserSettings(db, chatId, user.id, { archived: true });
+    return { settings };
+  });
+
+  app.delete('/api/chats/:chatId/archive', async (request, reply) => {
+    const user = await requireUser(request, reply, db);
+    if (!user) return;
+    const { chatId } = z.object({ chatId: z.string() }).parse(request.params);
+    if (!hasChatAccess(db, chatId, user.id)) return reply.code(403).send({ error: 'forbidden' });
+    const settings = upsertChatUserSettings(db, chatId, user.id, { archived: false });
+    return { settings };
   });
 
   app.post('/api/chats/:chatId/read', async (request, reply) => {
@@ -641,7 +857,30 @@ export function buildApp(options: { db?: Db } = {}) {
     const messageId = id('msg');
     const settings = chatSettings(db, chatId);
     const autoDeleteAt = settings.autoDeleteSeconds === null ? null : new Date(Date.now() + settings.autoDeleteSeconds * 1000).toISOString();
-    db.prepare('INSERT INTO messages (id, chat_id, sender_id, type, text, reply_to_message_id, auto_delete_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(messageId, chatId, user.id, 'text', body.text, body.replyToMessageId ?? null, autoDeleteAt, nowIso());
+    const previewUrl = firstHttpUrl(body.text);
+    const preview = previewUrl ? await fetchLinkPreview(previewUrl) : null;
+    db.prepare(`
+      INSERT INTO messages (
+        id, chat_id, sender_id, type, text, reply_to_message_id, auto_delete_at,
+        preview_url, preview_title, preview_description, preview_image_url, preview_domain,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      messageId,
+      chatId,
+      user.id,
+      'text',
+      body.text,
+      body.replyToMessageId ?? null,
+      autoDeleteAt,
+      preview?.url ?? null,
+      preview?.title ?? null,
+      preview?.description ?? null,
+      preview?.imageUrl ?? null,
+      preview?.domain ?? null,
+      nowIso()
+    );
     const message = messageView(db, messageId);
     if (!message) throw new Error('message_not_created');
     const members = chatMembers(db, chatId);
@@ -679,9 +918,57 @@ export function buildApp(options: { db?: Db } = {}) {
     const settings = chatSettings(db, chatId);
     const autoDeleteAt = settings.autoDeleteSeconds === null ? null : new Date(Date.now() + settings.autoDeleteSeconds * 1000).toISOString();
     db.prepare(`
-      INSERT INTO messages (id, chat_id, sender_id, type, text, media_url, duration_ms, auto_delete_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, chatId, user.id, 'voice', '', mediaUrl, query.durationMs, autoDeleteAt, nowIso());
+      INSERT INTO messages (id, chat_id, sender_id, type, text, media_url, duration_ms, filename, mime_type, size_bytes, auto_delete_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, chatId, user.id, 'voice', '', mediaUrl, query.durationMs, filename, contentType, body.length, autoDeleteAt, nowIso());
+    const message = messageView(db, messageId);
+    const members = chatMembers(db, chatId);
+    broadcastToUsers(members, { type: 'message.created', chatId, message });
+    return reply.code(201).send({ message });
+  });
+
+  app.post('/api/chats/:chatId/attachments', async (request, reply) => {
+    const user = await requireUser(request, reply, db);
+    if (!user) return;
+    const { chatId } = z.object({ chatId: z.string() }).parse(request.params);
+    const query = z.object({ filename: z.string().trim().min(1).max(240).optional() }).parse(request.query);
+    if (!hasChatAccess(db, chatId, user.id)) return reply.code(403).send({ error: 'forbidden' });
+    const chat = db.prepare('SELECT type FROM chats WHERE id = ?').get(chatId) as { type: string } | undefined;
+    if (chat?.type !== 'direct') return reply.code(400).send({ error: 'direct_chat_required' });
+
+    const body = request.body;
+    if (!Buffer.isBuffer(body) || body.length < 1) return reply.code(400).send({ error: 'invalid_attachment' });
+    if (body.length > maxAttachmentBytes) return reply.code(413).send({ error: 'attachment_too_large' });
+
+    const contentType = String(request.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+    const typeInfo = attachmentTypes[contentType];
+    if (!typeInfo) return reply.code(400).send({ error: 'invalid_attachment_type' });
+
+    const messageId = id('msg');
+    const clientFilename = safeClientFilename(query.filename ?? request.headers['x-filename']);
+    const storedFilename = `${messageId}.${typeInfo.extension}`;
+    fs.writeFileSync(path.join(attachmentsDir, storedFilename), body);
+    const mediaUrl = `/uploads/attachments/${storedFilename}`;
+    const settings = chatSettings(db, chatId);
+    const autoDeleteAt = settings.autoDeleteSeconds === null ? null : new Date(Date.now() + settings.autoDeleteSeconds * 1000).toISOString();
+
+    db.prepare(`
+      INSERT INTO messages (id, chat_id, sender_id, type, text, media_url, filename, mime_type, size_bytes, thumbnail_url, auto_delete_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      messageId,
+      chatId,
+      user.id,
+      typeInfo.messageType,
+      '',
+      mediaUrl,
+      clientFilename ?? storedFilename,
+      contentType,
+      body.length,
+      null,
+      autoDeleteAt,
+      nowIso()
+    );
     const message = messageView(db, messageId);
     const members = chatMembers(db, chatId);
     broadcastToUsers(members, { type: 'message.created', chatId, message });
@@ -724,7 +1011,19 @@ export function buildApp(options: { db?: Db } = {}) {
 
     db.prepare(`
       UPDATE messages
-      SET deleted_at = ?, text = '', media_url = NULL, duration_ms = NULL
+      SET deleted_at = ?,
+          text = '',
+          media_url = NULL,
+          duration_ms = NULL,
+          filename = NULL,
+          mime_type = NULL,
+          size_bytes = NULL,
+          thumbnail_url = NULL,
+          preview_url = NULL,
+          preview_title = NULL,
+          preview_description = NULL,
+          preview_image_url = NULL,
+          preview_domain = NULL
       WHERE chat_id = ? AND id IN (${placeholders})
     `).run(nowIso(), chatId, ...body.messageIds);
     db.prepare(`DELETE FROM pinned_messages WHERE chat_id = ? AND message_id IN (${placeholders})`).run(chatId, ...body.messageIds);
@@ -848,7 +1147,7 @@ export function buildApp(options: { db?: Db } = {}) {
       addClient(
         user.id,
         socket,
-        (_userId, data) => handleCallSignal(db, user, data),
+        (_userId, data) => handleRealtimeClientEvent(db, user, data),
         (userId) => {
           try {
             db.prepare('UPDATE users SET last_seen_at = ? WHERE id = ?').run(nowIso(), userId);
