@@ -382,11 +382,19 @@ describe('contacts, chats, and messages', () => {
     expect(message.mimeType).toBe('image/jpeg');
     expect(message.sizeBytes).toBe(bytes.length);
     expect(message.mediaUrl).toMatch(/^\/uploads\/attachments\/msg_.*\.jpg$/);
+    expect(message.attachment).toMatchObject({
+      kind: 'photo',
+      fileName: 'family.jpg',
+      url: message.mediaUrl,
+      mimeType: 'image/jpeg',
+      sizeBytes: bytes.length
+    });
     expect(fs.existsSync(path.join(uploadsDir, 'attachments', path.basename(message.mediaUrl)))).toBe(true);
 
     const messages = await authGet(anna.token, `/api/chats/${encodeURIComponent(chatId)}/messages`);
     expect(messages.json().messages[0].id).toBe(message.id);
     expect(messages.json().messages[0].mimeType).toBe('image/jpeg');
+    expect(messages.json().messages[0].attachment.url).toBe(message.mediaUrl);
   });
 
   it('uploads plain text attachments as documents', async () => {

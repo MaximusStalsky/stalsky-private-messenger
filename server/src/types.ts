@@ -27,6 +27,17 @@ export type MessageView = {
   mimeType: string | null;
   sizeBytes: number | null;
   thumbnailUrl: string | null;
+  attachment?: {
+    kind: 'photo' | 'file' | 'document';
+    type: 'photo' | 'file' | 'document';
+    fileName: string;
+    filename: string;
+    url: string;
+    mediaUrl: string;
+    thumbnailUrl: string | null;
+    mimeType: string | null;
+    sizeBytes: number | null;
+  } | null;
   linkPreview: {
     url: string;
     title: string | null;

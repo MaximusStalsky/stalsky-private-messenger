@@ -1702,12 +1702,19 @@ class ChatMessage {
       if (first is Map<String, dynamic>) {
         attachment = MessageAttachment.fromJson(first);
       }
-    } else if (json['fileUrl'] != null || json['attachmentUrl'] != null) {
+    } else if (json['fileUrl'] != null ||
+        json['attachmentUrl'] != null ||
+        (json['mediaUrl'] != null &&
+            const ['photo', 'file', 'document'].contains(json['type']))) {
       final fileUri = Uri.tryParse(
-        json['fileUrl']?.toString() ?? json['attachmentUrl']?.toString() ?? '',
+        json['fileUrl']?.toString() ??
+            json['attachmentUrl']?.toString() ??
+            json['mediaUrl']?.toString() ??
+            '',
       );
       final fileName =
           json['fileName'] as String? ??
+          json['filename'] as String? ??
           (fileUri == null || fileUri.pathSegments.isEmpty
               ? null
               : fileUri.pathSegments.last) ??
@@ -1716,7 +1723,10 @@ class ChatMessage {
       attachment = MessageAttachment(
         kind: attachmentKindFor(fileName, mimeType),
         fileName: fileName,
-        url: json['fileUrl'] as String? ?? json['attachmentUrl'] as String?,
+        url:
+            json['fileUrl'] as String? ??
+            json['attachmentUrl'] as String? ??
+            json['mediaUrl'] as String?,
         thumbnailUrl: json['thumbnailUrl'] as String?,
         mimeType: mimeType,
         sizeBytes: (json['sizeBytes'] as num? ?? json['size'] as num?)?.toInt(),

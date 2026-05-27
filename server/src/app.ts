@@ -274,8 +274,22 @@ function messageFromRow(message: Omit<MessageView, 'reactions' | 'linkPreview'> 
   previewImageUrl: string | null;
   previewDomain: string | null;
 }) {
+  const attachment = message.mediaUrl && ['photo', 'file', 'document'].includes(message.type)
+    ? {
+        kind: message.type,
+        type: message.type,
+        fileName: message.filename ?? path.basename(message.mediaUrl),
+        filename: message.filename ?? path.basename(message.mediaUrl),
+        url: message.mediaUrl,
+        mediaUrl: message.mediaUrl,
+        thumbnailUrl: message.thumbnailUrl,
+        mimeType: message.mimeType,
+        sizeBytes: message.sizeBytes
+      }
+    : null;
   return {
     ...message,
+    attachment,
     linkPreview: message.previewUrl && message.previewDomain
       ? {
           url: message.previewUrl,
