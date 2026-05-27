@@ -867,6 +867,42 @@ AttachmentKind attachmentKindFor(String fileName, String? mimeType) {
   return AttachmentKind.file;
 }
 
+String? mimeTypeForFile(String fileName, String? candidate) {
+  final normalized = candidate?.trim().toLowerCase();
+  if (normalized != null && normalized.contains('/')) return normalized;
+  final nameParts = fileName.split('.');
+  final extension = (normalized == null || normalized.isEmpty)
+      ? (nameParts.length > 1 ? nameParts.last.toLowerCase() : null)
+      : normalized.replaceFirst(RegExp(r'^\.'), '');
+  switch (extension) {
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg';
+    case 'png':
+      return 'image/png';
+    case 'webp':
+      return 'image/webp';
+    case 'gif':
+      return 'image/gif';
+    case 'pdf':
+      return 'application/pdf';
+    case 'doc':
+      return 'application/msword';
+    case 'docx':
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    case 'xls':
+      return 'application/vnd.ms-excel';
+    case 'xlsx':
+      return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    case 'zip':
+      return 'application/zip';
+    case 'txt':
+      return 'text/plain';
+    default:
+      return null;
+  }
+}
+
 IconData attachmentIcon(AttachmentKind kind) {
   switch (kind) {
     case AttachmentKind.photo:
@@ -1097,7 +1133,7 @@ class ApiClient {
     String? text,
     String? replyToMessageId,
   }) {
-    final contentType = mimeType ?? switch (kind) {
+    final contentType = mimeTypeForFile(fileName, mimeType) ?? switch (kind) {
       AttachmentKind.photo => 'image/jpeg',
       AttachmentKind.document => 'application/pdf',
       AttachmentKind.file => 'application/octet-stream',
@@ -5554,15 +5590,16 @@ class _ChatPaneState extends State<ChatPane> {
       bytes = await XFile(file.path!).readAsBytes();
     }
     if (bytes == null) return;
+    final mimeType = mimeTypeForFile(file.name, file.extension);
     final kind = forceDocument
         ? AttachmentKind.document
-        : attachmentKindFor(file.name, file.extension);
+        : attachmentKindFor(file.name, mimeType);
     final attachment = MessageAttachment(
       kind: kind,
       fileName: file.name,
       localPath: file.path,
       localBytes: kind == AttachmentKind.photo ? bytes : null,
-      mimeType: file.extension,
+      mimeType: mimeType,
       sizeBytes: file.size > 0 ? file.size : bytes.length,
     );
     final caption = text.text.trim();
