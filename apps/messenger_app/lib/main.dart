@@ -1187,6 +1187,8 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+const mediaChannel = MethodChannel('messenger_app/media');
+
 class NotificationService {
   static const _callChannel = MethodChannel('messenger_app/call_notifications');
   static const _messagesChannelId = 'messages';
@@ -5724,6 +5726,7 @@ class _ChatPaneState extends State<ChatPane> {
     BuildContext context,
     ChatMessage message,
     bool mine,
+    bool interactive,
   ) {
     final palette = AppPalette.of(context);
     final accent = mine ? palette.textOnOutgoing : palette.accent;
@@ -5735,7 +5738,7 @@ class _ChatPaneState extends State<ChatPane> {
         mainAxisSize: MainAxisSize.min,
         children: [
           IconButton.filled(
-            onPressed: () => toggleVoicePlayback(message),
+            onPressed: interactive ? () => toggleVoicePlayback(message) : null,
             style: IconButton.styleFrom(
               fixedSize: const Size.square(42),
               backgroundColor: mine
@@ -5789,6 +5792,117 @@ class _ChatPaneState extends State<ChatPane> {
     );
   }
 
+  Future<Uint8List?> attachmentBytes(MessageAttachment attachment) async {
+    if (attachment.localBytes != null) return attachment.localBytes;
+    if (!kIsWeb &&
+        attachment.localPath != null &&
+        attachment.localPath!.isNotEmpty) {
+      try {
+        return await XFile(attachment.localPath!).readAsBytes();
+      } catch (_) {}
+    }
+    final url = mediaUrl(widget.apiBaseUrl, attachment.url);
+    if (url.isEmpty) return null;
+    final response = await http.get(Uri.parse(url));
+    if (response.statusCode >= 400 || response.bodyBytes.isEmpty) return null;
+    return response.bodyBytes;
+  }
+
+  Future<void> savePhotoAttachment(MessageAttachment attachment) async {
+    final bytes = await attachmentBytes(attachment);
+    if (bytes == null) return;
+    final fileName = attachment.fileName.isEmpty
+        ? 'my_messenger_${DateTime.now().millisecondsSinceEpoch}.jpg'
+        : attachment.fileName;
+    try {
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+        await mediaChannel.invokeMethod<void>('saveImageToGallery', {
+          'bytes': bytes,
+          'fileName': fileName,
+          'mimeType': attachment.mimeType ?? mimeTypeForFile(fileName, null) ?? 'image/jpeg',
+        });
+      } else {
+        final directory = await getTemporaryDirectory();
+        await XFile.fromData(
+          bytes,
+          name: fileName,
+          mimeType: attachment.mimeType,
+        ).saveTo('${directory.path}/$fileName');
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Saved')),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not save image')),
+        );
+      }
+    }
+  }
+
+  Future<void> openPhotoPreview(MessageAttachment attachment) async {
+    final palette = AppPalette.of(context);
+    final bytes = attachment.localBytes;
+    final url = mediaUrl(widget.apiBaseUrl, attachment.url);
+    await showGeneralDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'Image preview',
+      barrierColor: Colors.black.withValues(alpha: 0.92),
+      transitionDuration: const Duration(milliseconds: 170),
+      pageBuilder: (context, animation, secondaryAnimation) {
+        final image = bytes != null
+            ? Image.memory(bytes, fit: BoxFit.contain)
+            : Image.network(url, fit: BoxFit.contain);
+        return SafeArea(
+          child: Material(
+            color: Colors.transparent,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => Navigator.of(context).pop(),
+                    child: InteractiveViewer(
+                      minScale: 0.8,
+                      maxScale: 4,
+                      child: Center(child: image),
+                    ),
+                  ),
+                ),
+                Positioned(
+                  left: 12,
+                  top: 12,
+                  child: PremiumIconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: Icons.close,
+                    tooltip: 'Close',
+                  ),
+                ),
+                Positioned(
+                  right: 12,
+                  top: 12,
+                  child: FilledButton.icon(
+                    onPressed: () => savePhotoAttachment(attachment),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: palette.accent,
+                      foregroundColor: palette.textOnOutgoing,
+                    ),
+                    icon: const Icon(Icons.download_outlined),
+                    label: const Text('Save'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Future<void> openAttachment(MessageAttachment attachment) async {
     if (!kIsWeb &&
         attachment.localPath != null &&
@@ -5805,6 +5919,7 @@ class _ChatPaneState extends State<ChatPane> {
     BuildContext context,
     ChatMessage message,
     bool mine,
+    bool interactive,
   ) {
     final attachment = message.attachment;
     if (attachment == null) return const SizedBox.shrink();
@@ -5830,7 +5945,7 @@ class _ChatPaneState extends State<ChatPane> {
           ClipRRect(
             borderRadius: BorderRadius.circular(12),
             child: InkWell(
-              onTap: () => openAttachment(attachment),
+              onTap: interactive ? () => openPhotoPreview(attachment) : null,
               child: SizedBox(
                 width: 260,
                 height: 180,
@@ -5849,7 +5964,7 @@ class _ChatPaneState extends State<ChatPane> {
       );
     }
     return InkWell(
-      onTap: () => openAttachment(attachment),
+      onTap: interactive ? () => openAttachment(attachment) : null,
       borderRadius: BorderRadius.circular(12),
       child: Container(
         constraints: const BoxConstraints(minWidth: 230, maxWidth: 310),
@@ -5924,6 +6039,7 @@ class _ChatPaneState extends State<ChatPane> {
     BuildContext context,
     ChatMessage message,
     bool mine,
+    bool interactive,
   ) {
     final preview = message.linkPreview;
     if (preview == null) return const SizedBox.shrink();
@@ -5936,7 +6052,7 @@ class _ChatPaneState extends State<ChatPane> {
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: InkWell(
-        onTap: preview.url == null
+        onTap: !interactive || preview.url == null
             ? null
             : () => launchUrl(
                 Uri.parse(preview.url!),
@@ -6437,6 +6553,7 @@ class _ChatPaneState extends State<ChatPane> {
                         final message = widget.messages[index];
                         final mine = message.senderId == widget.user.id;
                         final isSelected = selectedIds.contains(message.id);
+                        final messageInteractive = selectedIds.isEmpty;
                         final isHighlighted = highlightedIds.contains(
                           message.id,
                         );
@@ -6540,12 +6657,18 @@ class _ChatPaneState extends State<ChatPane> {
                                     buildReplyPreview(context, message, mine),
                                     if (message.voiceUrl != null ||
                                         message.localVoicePath != null)
-                                      buildVoiceMessage(context, message, mine)
+                                      buildVoiceMessage(
+                                        context,
+                                        message,
+                                        mine,
+                                        messageInteractive,
+                                      )
                                     else if (message.attachment != null)
                                       buildAttachmentMessage(
                                         context,
                                         message,
                                         mine,
+                                        messageInteractive,
                                       )
                                     else
                                       Text(
@@ -6558,7 +6681,12 @@ class _ChatPaneState extends State<ChatPane> {
                                           height: 1.34,
                                         ),
                                       ),
-                                    buildLinkPreview(context, message, mine),
+                                    buildLinkPreview(
+                                      context,
+                                      message,
+                                      mine,
+                                      messageInteractive,
+                                    ),
                                     if (message.reactions.isNotEmpty)
                                       Padding(
                                         padding: const EdgeInsets.only(top: 6),
