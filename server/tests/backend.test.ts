@@ -389,6 +389,28 @@ describe('contacts, chats, and messages', () => {
     expect(messages.json().messages[0].mimeType).toBe('image/jpeg');
   });
 
+  it('uploads plain text attachments as documents', async () => {
+    const max = await register('max');
+    await register('anna');
+    await authPost(max.token, '/api/contacts', { username: 'anna' });
+    const chatId = (await authGet(max.token, '/api/chats')).json().chats[0].id;
+    const bytes = Buffer.from('family note');
+
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/chats/${encodeURIComponent(chatId)}/attachments?filename=note.txt`,
+      headers: { authorization: `Bearer ${max.token}`, 'content-type': 'text/plain' },
+      payload: bytes
+    });
+
+    expect(uploaded.statusCode).toBe(201);
+    const message = uploaded.json().message;
+    expect(message.type).toBe('document');
+    expect(message.filename).toBe('note.txt');
+    expect(message.mimeType).toBe('text/plain');
+    expect(message.mediaUrl).toMatch(/^\/uploads\/attachments\/msg_.*\.txt$/);
+  });
+
   it('pins and archives chats per current user', async () => {
     const max = await register('max');
     const anna = await register('anna');

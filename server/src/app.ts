@@ -72,6 +72,7 @@ const attachmentTypes: Record<string, { extension: string; messageType: 'photo' 
   'application/vnd.ms-excel': { extension: 'xls', messageType: 'document' },
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': { extension: 'xlsx', messageType: 'document' },
   'application/zip': { extension: 'zip', messageType: 'file' },
+  'text/plain': { extension: 'txt', messageType: 'document' },
   'application/octet-stream': { extension: 'bin', messageType: 'file' }
 };
 
@@ -524,6 +525,7 @@ export function buildApp(options: { db?: Db } = {}) {
       'application/vnd.ms-excel',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'application/zip',
+      'text/plain',
       'application/octet-stream'
     ],
     { parseAs: 'buffer', bodyLimit: maxAttachmentBytes },
