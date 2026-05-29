@@ -434,6 +434,46 @@ describe('contacts, chats, and messages', () => {
     expect(heic.statusCode).toBe(201);
     expect(heic.json().message.type).toBe('photo');
     expect(heic.json().message.mediaUrl).toMatch(/\.heic$/);
+
+    const jpegAlias = await app.inject({
+      method: 'POST',
+      url: `/api/chats/${encodeURIComponent(chatId)}/attachments?filename=phone.jfif`,
+      headers: { authorization: `Bearer ${max.token}`, 'content-type': 'image/pjpeg' },
+      payload: Buffer.from([0, 1, 2, 3])
+    });
+    expect(jpegAlias.statusCode).toBe(201);
+    expect(jpegAlias.json().message.type).toBe('photo');
+    expect(jpegAlias.json().message.mediaUrl).toMatch(/\.jpg$/);
+  });
+
+  it('accepts common office and archive attachment MIME types', async () => {
+    const max = await register('max');
+    await register('anna');
+    await authPost(max.token, '/api/contacts', { username: 'anna' });
+    const chatId = (await authGet(max.token, '/api/chats')).json().chats[0].id;
+
+    const pptx = await app.inject({
+      method: 'POST',
+      url: `/api/chats/${encodeURIComponent(chatId)}/attachments?filename=slides.pptx`,
+      headers: {
+        authorization: `Bearer ${max.token}`,
+        'content-type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+      },
+      payload: Buffer.from([1, 2, 3])
+    });
+    expect(pptx.statusCode).toBe(201);
+    expect(pptx.json().message.type).toBe('document');
+    expect(pptx.json().message.mediaUrl).toMatch(/\.pptx$/);
+
+    const archive = await app.inject({
+      method: 'POST',
+      url: `/api/chats/${encodeURIComponent(chatId)}/attachments?filename=backup.7z`,
+      headers: { authorization: `Bearer ${max.token}`, 'content-type': 'application/x-7z-compressed' },
+      payload: Buffer.from([1, 2, 3])
+    });
+    expect(archive.statusCode).toBe(201);
+    expect(archive.json().message.type).toBe('file');
+    expect(archive.json().message.mediaUrl).toMatch(/\.7z$/);
   });
 
   it('pins and archives chats per current user', async () => {

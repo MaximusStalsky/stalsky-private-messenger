@@ -877,6 +877,8 @@ String? mimeTypeForFile(String fileName, String? candidate) {
   switch (extension) {
     case 'jpg':
     case 'jpeg':
+    case 'jpe':
+    case 'jfif':
       return 'image/jpeg';
     case 'png':
       return 'image/png';
@@ -898,8 +900,22 @@ String? mimeTypeForFile(String fileName, String? candidate) {
       return 'application/vnd.ms-excel';
     case 'xlsx':
       return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    case 'ppt':
+      return 'application/vnd.ms-powerpoint';
+    case 'pptx':
+      return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+    case 'rtf':
+      return 'application/rtf';
+    case 'csv':
+      return 'text/csv';
     case 'zip':
       return 'application/zip';
+    case '7z':
+      return 'application/x-7z-compressed';
+    case 'rar':
+      return 'application/x-rar-compressed';
+    case 'gz':
+      return 'application/gzip';
     case 'txt':
       return 'text/plain';
     default:
@@ -5068,6 +5084,9 @@ class _ChatPaneState extends State<ChatPane> {
   Timer? typingStopTimer;
   bool typingActive = false;
 
+  String? lastMessageId(List<ChatMessage> messages) =>
+      messages.isEmpty ? null : messages.last.id;
+
   @override
   void initState() {
     super.initState();
@@ -5104,26 +5123,34 @@ class _ChatPaneState extends State<ChatPane> {
   @override
   void didUpdateWidget(covariant ChatPane oldWidget) {
     super.didUpdateWidget(oldWidget);
+    final chatChanged = widget.chat?.id != oldWidget.chat?.id;
+    final lastMessageChanged =
+        lastMessageId(widget.messages) != lastMessageId(oldWidget.messages);
     if (widget.chat?.id != oldWidget.chat?.id ||
-        widget.messages.length != oldWidget.messages.length) {
-      if (widget.chat?.id != oldWidget.chat?.id) {
+        widget.messages.length != oldWidget.messages.length ||
+        lastMessageChanged) {
+      if (chatChanged) {
         typingStopTimer?.cancel();
         typingActive = false;
         text.text = widget.draftText;
       }
-      WidgetsBinding.instance.addPostFrameCallback(
-        (_) => scheduleScrollToBottom(),
-      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        scheduleScrollToBottom(jump: chatChanged);
+      });
     }
   }
 
-  void scheduleScrollToBottom() {
-    scrollToBottom(jump: true);
+  void scheduleScrollToBottom({bool jump = true}) {
+    scrollToBottom(jump: jump);
     Future.delayed(const Duration(milliseconds: 60), () {
-      if (mounted) scrollToBottom(jump: true);
+      if (mounted) scrollToBottom(jump: jump);
     });
     Future.delayed(const Duration(milliseconds: 180), () {
-      if (mounted) scrollToBottom(jump: true);
+      if (mounted) scrollToBottom(jump: jump);
+    });
+    Future.delayed(const Duration(milliseconds: 360), () {
+      if (mounted) scrollToBottom(jump: jump);
     });
   }
 
@@ -5588,18 +5615,24 @@ class _ChatPaneState extends State<ChatPane> {
   }
 
   Future<void> pickPhotoAttachment() async {
-    final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+    final picked = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 2048,
+      maxHeight: 2048,
+      imageQuality: 82,
+    );
     if (picked == null) return;
     final bytes = await picked.readAsBytes();
     final fileName = picked.name.isEmpty
         ? 'photo_${DateTime.now().millisecondsSinceEpoch}.jpg'
         : picked.name;
+    final mimeType = mimeTypeForFile(fileName, picked.mimeType) ?? 'image/jpeg';
     final attachment = MessageAttachment(
       kind: AttachmentKind.photo,
       fileName: fileName,
       localPath: picked.path,
       localBytes: bytes,
-      mimeType: picked.mimeType ?? 'image/jpeg',
+      mimeType: mimeType,
       sizeBytes: bytes.length,
     );
     final caption = text.text.trim();

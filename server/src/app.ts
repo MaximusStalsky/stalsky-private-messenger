@@ -63,22 +63,35 @@ const indicatorSchema = z.object({
 
 const attachmentTypes: Record<string, { extension: string; messageType: 'photo' | 'file' | 'document' }> = {
   'image/jpeg': { extension: 'jpg', messageType: 'photo' },
+  'image/jpg': { extension: 'jpg', messageType: 'photo' },
+  'image/pjpeg': { extension: 'jpg', messageType: 'photo' },
   'image/png': { extension: 'png', messageType: 'photo' },
   'image/webp': { extension: 'webp', messageType: 'photo' },
   'image/gif': { extension: 'gif', messageType: 'photo' },
   'image/heic': { extension: 'heic', messageType: 'photo' },
   'image/heif': { extension: 'heif', messageType: 'photo' },
+  'image/heic-sequence': { extension: 'heic', messageType: 'photo' },
+  'image/heif-sequence': { extension: 'heif', messageType: 'photo' },
   'application/pdf': { extension: 'pdf', messageType: 'document' },
   'application/msword': { extension: 'doc', messageType: 'document' },
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': { extension: 'docx', messageType: 'document' },
   'application/vnd.ms-excel': { extension: 'xls', messageType: 'document' },
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': { extension: 'xlsx', messageType: 'document' },
+  'application/vnd.ms-powerpoint': { extension: 'ppt', messageType: 'document' },
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': { extension: 'pptx', messageType: 'document' },
+  'application/rtf': { extension: 'rtf', messageType: 'document' },
+  'text/rtf': { extension: 'rtf', messageType: 'document' },
+  'text/csv': { extension: 'csv', messageType: 'document' },
   'application/zip': { extension: 'zip', messageType: 'file' },
+  'application/x-zip-compressed': { extension: 'zip', messageType: 'file' },
+  'application/x-7z-compressed': { extension: '7z', messageType: 'file' },
+  'application/x-rar-compressed': { extension: 'rar', messageType: 'file' },
+  'application/gzip': { extension: 'gz', messageType: 'file' },
   'text/plain': { extension: 'txt', messageType: 'document' },
   'application/octet-stream': { extension: 'bin', messageType: 'file' }
 };
 
-const maxAttachmentBytes = 25 * 1024 * 1024;
+const maxAttachmentBytes = 100 * 1024 * 1024;
 
 function fallbackAttachmentType(contentType: string, filename: string | null) {
   if (contentType.startsWith('image/')) {
@@ -537,11 +550,15 @@ export function buildApp(options: { db?: Db } = {}) {
   app.addContentTypeParser(
     [
       'image/jpeg',
+      'image/jpg',
+      'image/pjpeg',
       'image/png',
       'image/webp',
       'image/gif',
       'image/heic',
       'image/heif',
+      'image/heic-sequence',
+      'image/heif-sequence',
       'audio/mpeg',
       'audio/mp4',
       'audio/aac',
@@ -553,7 +570,16 @@ export function buildApp(options: { db?: Db } = {}) {
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       'application/vnd.ms-excel',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-powerpoint',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'application/rtf',
+      'text/rtf',
+      'text/csv',
       'application/zip',
+      'application/x-zip-compressed',
+      'application/x-7z-compressed',
+      'application/x-rar-compressed',
+      'application/gzip',
       'text/plain',
       'application/octet-stream'
     ],
