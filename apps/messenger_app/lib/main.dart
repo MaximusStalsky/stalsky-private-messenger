@@ -1992,6 +1992,7 @@ class _MessengerHomeState extends State<MessengerHome>
   final messages = <String, List<ChatMessage>>{};
   final pendingVoicePaths = <String, List<String>>{};
   final pendingOutgoing = <String, PendingOutgoing>{};
+  final pendingSocketEvents = <Map<String, dynamic>>[];
   final readByPeerIds = <String, Set<String>>{};
   final peerActivities = <String, PeerActivity>{};
   final chatDrafts = <String, String>{};
@@ -2002,8 +2003,10 @@ class _MessengerHomeState extends State<MessengerHome>
   StreamSubscription<CallNotificationAction>? callNotificationActionSub;
   Timer? incomingCallTimeoutTimer;
   Timer? activityCleanupTimer;
+  Timer? socketReconnectTimer;
   String? pendingNotificationChatId;
   AppLifecycleState lifecycleState = AppLifecycleState.resumed;
+  bool socketConnected = false;
   VoiceCallSession? voiceCall;
   RTCPeerConnection? peerConnection;
   MediaStream? localVoiceStream;
@@ -2025,6 +2028,7 @@ class _MessengerHomeState extends State<MessengerHome>
     callNotificationActionSub?.cancel();
     incomingCallTimeoutTimer?.cancel();
     activityCleanupTimer?.cancel();
+    socketReconnectTimer?.cancel();
     channel?.sink.close();
     for (final track in localVoiceStream?.getTracks() ?? <MediaStreamTrack>[]) {
       track.stop();
@@ -2100,15 +2104,29 @@ class _MessengerHomeState extends State<MessengerHome>
   }
 
   void connectSocket() {
+    socketReconnectTimer?.cancel();
     socketSub?.cancel();
     channel?.sink.close();
+    socketConnected = false;
     activityCleanupTimer?.cancel();
     if (token == null) return;
     final uri = Uri.parse(
       '${wsBaseFor(api.baseUrl)}/ws?token=${Uri.encodeComponent(token!)}',
     );
-    channel = WebSocketChannel.connect(uri);
-    socketSub = channel!.stream.listen((event) {
+    final nextChannel = WebSocketChannel.connect(uri);
+    channel = nextChannel;
+    nextChannel.ready.then(
+      (_) {
+        if (!mounted || channel != nextChannel) return;
+        socketConnected = true;
+        flushPendingSocketEvents();
+      },
+      onError: (_) {
+        if (!mounted || channel != nextChannel) return;
+        scheduleSocketReconnect();
+      },
+    );
+    socketSub = nextChannel.stream.listen((event) {
       final data = jsonDecode(event as String) as Map<String, dynamic>;
       if (data['type'] == 'message.created') {
         final message = ChatMessage.fromJson(
@@ -2207,7 +2225,11 @@ class _MessengerHomeState extends State<MessengerHome>
           (data['type'] as String).startsWith('call.')) {
         unawaited(handleCallSignal(data));
       }
-    }, onError: (_) {});
+    }, onError: (_) {
+      scheduleSocketReconnect();
+    }, onDone: () {
+      scheduleSocketReconnect();
+    });
     activityCleanupTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (!mounted) return;
       final now = DateTime.now();
@@ -2217,6 +2239,33 @@ class _MessengerHomeState extends State<MessengerHome>
       );
       if (before != peerActivities.length) setState(() {});
     });
+  }
+
+  void scheduleSocketReconnect() {
+    socketConnected = false;
+    if (token == null || socketReconnectTimer?.isActive == true) return;
+    socketReconnectTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted || token == null) return;
+      connectSocket();
+    });
+  }
+
+  void flushPendingSocketEvents() {
+    final current = channel;
+    if (!socketConnected || current == null || pendingSocketEvents.isEmpty) {
+      return;
+    }
+    final events = List<Map<String, dynamic>>.from(pendingSocketEvents);
+    pendingSocketEvents.clear();
+    for (final event in events) {
+      try {
+        current.sink.add(jsonEncode(event));
+      } catch (_) {
+        pendingSocketEvents.insert(0, event);
+        scheduleSocketReconnect();
+        break;
+      }
+    }
   }
 
   void replaceLocalMessage(ChatMessage message) {
@@ -2334,7 +2383,26 @@ class _MessengerHomeState extends State<MessengerHome>
   }
 
   void sendSocketEvent(Map<String, dynamic> event) {
-    channel?.sink.add(jsonEncode(event));
+    final current = channel;
+    if (socketConnected && current != null) {
+      try {
+        current.sink.add(jsonEncode(event));
+        return;
+      } catch (_) {
+        socketConnected = false;
+      }
+    }
+    pendingSocketEvents.add(event);
+    if (pendingSocketEvents.length > 100) {
+      pendingSocketEvents.removeRange(0, pendingSocketEvents.length - 100);
+    }
+    if (token != null) {
+      if (current == null) {
+        connectSocket();
+      } else {
+        scheduleSocketReconnect();
+      }
+    }
   }
 
   void sendChatActivity(
@@ -2708,6 +2776,7 @@ class _MessengerHomeState extends State<MessengerHome>
     await prefs.remove('auth_token');
     await socketSub?.cancel();
     await channel?.sink.close();
+    socketReconnectTimer?.cancel();
     setState(() {
       token = null;
       api.token = null;
@@ -2716,6 +2785,8 @@ class _MessengerHomeState extends State<MessengerHome>
       chats.clear();
       messages.clear();
       pendingOutgoing.clear();
+      pendingSocketEvents.clear();
+      socketConnected = false;
       peerActivities.clear();
       chatDrafts.clear();
       selectedChat = null;
