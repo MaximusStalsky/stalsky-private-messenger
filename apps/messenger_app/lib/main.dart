@@ -884,6 +884,10 @@ String? mimeTypeForFile(String fileName, String? candidate) {
       return 'image/webp';
     case 'gif':
       return 'image/gif';
+    case 'heic':
+      return 'image/heic';
+    case 'heif':
+      return 'image/heif';
     case 'pdf':
       return 'application/pdf';
     case 'doc':
@@ -1972,6 +1976,7 @@ class _MessengerHomeState extends State<MessengerHome>
   final messages = <String, List<ChatMessage>>{};
   final pendingVoicePaths = <String, List<String>>{};
   final pendingOutgoing = <String, PendingOutgoing>{};
+  final readByPeerIds = <String, Set<String>>{};
   final peerActivities = <String, PeerActivity>{};
   final chatDrafts = <String, String>{};
   ChatSummary? selectedChat;
@@ -2157,6 +2162,7 @@ class _MessengerHomeState extends State<MessengerHome>
             const <String>{};
         final readerId = data['readerId'] as String?;
         if (chatId != null && ids.isNotEmpty && readerId != currentUser?.id) {
+          readByPeerIds.putIfAbsent(chatId, () => <String>{}).addAll(ids);
           setState(() {
             final list = messages[chatId];
             if (list == null) return;
@@ -2201,10 +2207,15 @@ class _MessengerHomeState extends State<MessengerHome>
     setState(() {
       final list = messages.putIfAbsent(message.chatId, () => []);
       final index = list.indexWhere((item) => item.id == message.id);
+      final resolved = message.copyWith(
+        readByPeer:
+            message.readByPeer ||
+            (readByPeerIds[message.chatId]?.contains(message.id) ?? false),
+      );
       if (index == -1) {
-        list.add(message);
+        list.add(resolved);
       } else {
-        list[index] = message;
+        list[index] = resolved;
       }
     });
   }
@@ -2213,10 +2224,15 @@ class _MessengerHomeState extends State<MessengerHome>
     setState(() {
       final list = messages.putIfAbsent(message.chatId, () => []);
       final index = list.indexWhere((item) => item.id == localId);
+      final resolved = message.copyWith(
+        readByPeer:
+            message.readByPeer ||
+            (readByPeerIds[message.chatId]?.contains(message.id) ?? false),
+      );
       if (index == -1) {
-        if (!list.any((item) => item.id == message.id)) list.add(message);
+        if (!list.any((item) => item.id == resolved.id)) list.add(resolved);
       } else {
-        list[index] = message;
+        list[index] = resolved;
       }
     });
   }
@@ -2224,13 +2240,18 @@ class _MessengerHomeState extends State<MessengerHome>
   void mergeIncomingMessage(ChatMessage message) {
     setState(() {
       final list = messages.putIfAbsent(message.chatId, () => []);
+      final incoming = message.copyWith(
+        readByPeer:
+            message.readByPeer ||
+            (readByPeerIds[message.chatId]?.contains(message.id) ?? false),
+      );
       final existingIndex = list.indexWhere((item) => item.id == message.id);
       if (existingIndex != -1) {
         pendingVoicePaths[message.chatId]?.remove(
           list[existingIndex].localVoicePath,
         );
         pendingOutgoing.remove(list[existingIndex].id);
-        list[existingIndex] = message.copyWith(
+        list[existingIndex] = incoming.copyWith(
           localVoicePath: list[existingIndex].localVoicePath,
           attachment: message.attachment?.copyWith(
             localPath: list[existingIndex].attachment?.localPath,
@@ -2256,7 +2277,7 @@ class _MessengerHomeState extends State<MessengerHome>
           final local = list[localIndex];
           pendingOutgoing.remove(local.id);
           pendingVoicePaths[message.chatId]?.remove(local.localVoicePath);
-          list[localIndex] = message.copyWith(
+          list[localIndex] = incoming.copyWith(
             localVoicePath: local.localVoicePath,
             attachment: message.attachment?.copyWith(
               localPath: local.attachment?.localPath,
@@ -2279,7 +2300,7 @@ class _MessengerHomeState extends State<MessengerHome>
         if (localIndex != -1) {
           final localPath = list[localIndex].localVoicePath;
           pendingVoicePaths[message.chatId]?.remove(localPath);
-          list[localIndex] = message.copyWith(
+          list[localIndex] = incoming.copyWith(
             localVoicePath: localPath,
             uploading: false,
           );
@@ -2289,10 +2310,10 @@ class _MessengerHomeState extends State<MessengerHome>
         final localPath = pending == null || pending.isEmpty
             ? null
             : pending.removeAt(0);
-        list.add(message.copyWith(localVoicePath: localPath, uploading: false));
+        list.add(incoming.copyWith(localVoicePath: localPath, uploading: false));
         return;
       }
-      list.add(message);
+      list.add(incoming);
     });
   }
 

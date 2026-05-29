@@ -66,6 +66,8 @@ const attachmentTypes: Record<string, { extension: string; messageType: 'photo' 
   'image/png': { extension: 'png', messageType: 'photo' },
   'image/webp': { extension: 'webp', messageType: 'photo' },
   'image/gif': { extension: 'gif', messageType: 'photo' },
+  'image/heic': { extension: 'heic', messageType: 'photo' },
+  'image/heif': { extension: 'heif', messageType: 'photo' },
   'application/pdf': { extension: 'pdf', messageType: 'document' },
   'application/msword': { extension: 'doc', messageType: 'document' },
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': { extension: 'docx', messageType: 'document' },
@@ -77,6 +79,17 @@ const attachmentTypes: Record<string, { extension: string; messageType: 'photo' 
 };
 
 const maxAttachmentBytes = 25 * 1024 * 1024;
+
+function fallbackAttachmentType(contentType: string, filename: string | null) {
+  if (contentType.startsWith('image/')) {
+    const extension = contentType.slice('image/'.length).replace(/[^a-z0-9]/g, '') || 'img';
+    return { extension: extension === 'jpeg' ? 'jpg' : extension, messageType: 'photo' as const };
+  }
+  const extension = filename && path.extname(filename).length > 1
+    ? path.extname(filename).slice(1).toLowerCase().replace(/[^a-z0-9]/g, '')
+    : '';
+  return { extension: extension || 'bin', messageType: 'file' as const };
+}
 
 function dataDirectory() {
   const dbPath = process.env.DATABASE_URL ?? path.join(process.cwd(), 'data', 'messenger.sqlite');
@@ -527,6 +540,8 @@ export function buildApp(options: { db?: Db } = {}) {
       'image/png',
       'image/webp',
       'image/gif',
+      'image/heic',
+      'image/heif',
       'audio/mpeg',
       'audio/mp4',
       'audio/aac',
@@ -957,11 +972,9 @@ export function buildApp(options: { db?: Db } = {}) {
     if (body.length > maxAttachmentBytes) return reply.code(413).send({ error: 'attachment_too_large' });
 
     const contentType = String(request.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
-    const typeInfo = attachmentTypes[contentType];
-    if (!typeInfo) return reply.code(400).send({ error: 'invalid_attachment_type' });
-
     const messageId = id('msg');
     const clientFilename = safeClientFilename(query.filename ?? request.headers['x-filename']);
+    const typeInfo = attachmentTypes[contentType] ?? fallbackAttachmentType(contentType, clientFilename);
     const storedFilename = `${messageId}.${typeInfo.extension}`;
     fs.writeFileSync(path.join(attachmentsDir, storedFilename), body);
     const mediaUrl = `/uploads/attachments/${storedFilename}`;

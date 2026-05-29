@@ -419,6 +419,23 @@ describe('contacts, chats, and messages', () => {
     expect(message.mediaUrl).toMatch(/^\/uploads\/attachments\/msg_.*\.txt$/);
   });
 
+  it('accepts modern phone image MIME types', async () => {
+    const max = await register('max');
+    await register('anna');
+    await authPost(max.token, '/api/contacts', { username: 'anna' });
+    const chatId = (await authGet(max.token, '/api/chats')).json().chats[0].id;
+
+    const heic = await app.inject({
+      method: 'POST',
+      url: `/api/chats/${encodeURIComponent(chatId)}/attachments?filename=phone.heic`,
+      headers: { authorization: `Bearer ${max.token}`, 'content-type': 'image/heic' },
+      payload: Buffer.from([0, 1, 2, 3])
+    });
+    expect(heic.statusCode).toBe(201);
+    expect(heic.json().message.type).toBe('photo');
+    expect(heic.json().message.mediaUrl).toMatch(/\.heic$/);
+  });
+
   it('pins and archives chats per current user', async () => {
     const max = await register('max');
     const anna = await register('anna');
